@@ -240,6 +240,29 @@ def repeatBackBody : List SlangStmt :=
 def repeatBackF32 : SlangShaderModule :=
   kernelModule .float .float .uint .float [fnPw, fnUnravel4, fnOff4] (entry1D threadgroup repeatBackBody)
 
+/-- `ggml_get_rows_back(a, idx, c)`: dst is f32 `[c.ne0, c.ne1]`, zero, then row `idx[i]` of dst gets row
+    `i` of `a` added. One thread per dst element `(j, row)`: the sum of `a[i, j]` over the `i` whose
+    `idx[i] = row`, in ascending `i`, from a zero start. ggml-cpu does the same adds in the same
+    order (it walks `i` and adds into dst), so the result is bit-exact. src1 (the i32 indices) is
+    read as uint, as GET_ROWS does. -/
+def getRowsBackBody : List SlangStmt :=
+  [ .decl ui "j", .decl ui "row", .decl ui "k2", .decl ui "k3"
+  , .expr (.call "unravel4" [v "e", u wDst, v "j", v "row", v "k2", v "k3"])
+  , .declInit ui "d" (.call "off4" [u wDst, v "j", v "row", u 0, u 0])
+  , .declInit ui "nidx" (mul (mul (pwN (wSrc 1 + tNe)) (pwN (wSrc 1 + tNe + 1))) (pwN (wSrc 1 + tNe + 2)))
+  , .declInit fl "acc" (fLit 0.0)
+  , .declInit ui "i" (u 0)
+  , .whileLoop (lt (v "i") (v "nidx"))
+      [ .ifNoElse (.bin "==" (.index (v "s1") (add (pwN (wSrc 1 + tOff)) (mul (v "i") (pwN (wSrc 1 + tNb))))) (v "row"))
+          [ .assign (v "acc") (add (v "acc") (.index (v "s0")
+              (add (add (pwN (wSrc 0 + tOff)) (mul (v "i") (pwN (wSrc 0 + tNb + 1))))
+                   (mul (v "j") (pwN (wSrc 0 + tNb)))))) ]
+      , inc "i" ]
+  , .assign (.index (v "dst") (v "d")) (v "acc") ]
+
+def getRowsBackF32 : SlangShaderModule :=
+  kernelModule .float .uint .uint .float [fnPw, fnUnravel4, fnOff4] (entry1D threadgroup getRowsBackBody)
+
 def ceLossBackF32 : SlangShaderModule :=
   kernelModule .float .float .float .float [fnPw, fnOff4] (entry1D threadgroup backBody)
 
@@ -253,6 +276,7 @@ def kernels : List (String × SlangShaderModule) :=
   , ("silu_back_f32", siluBackF32)
   , ("soft_max_back_f32", smBackF32)
   , ("rms_norm_back_f32", rmsBackF32)
-  , ("repeat_back_f32", repeatBackF32) ]
+  , ("repeat_back_f32", repeatBackF32)
+  , ("get_rows_back_f32", getRowsBackF32) ]
 
 end Ggml.SlangCodegen.Loss

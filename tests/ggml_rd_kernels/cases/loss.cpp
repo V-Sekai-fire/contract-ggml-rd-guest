@@ -7,6 +7,7 @@
 // test-backend-ops' NMSE (1e-7), not bit equality.
 #include <array>
 #include <cstdio>
+#include <random>
 #include "../l2.h"
 namespace {
 // pad > 0: both sources are views of rows `pad` columns wider, so nb1 is not ne0 * 4.
@@ -125,8 +126,39 @@ void add_repeat_back(std::vector<L2Case> &out, std::array<int64_t, 4> ne, std::a
 	};
 	out.push_back(c);
 }
+
+// GET_ROWS_BACK(a, idx, c): scatter-add a's rows into a zero [nc, ndst] by idx. Indices are drawn in
+// [0, ndst) with repeats, so rows really do accumulate. A row that is never hit stays zero.
+void add_get_rows_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t ndst) {
+	L2Case c;
+	char n[96];
+	std::snprintf(n, sizeof n, "GET_ROWS_BACK nc=%lld nr=%lld ndst=%lld", (long long)nc, (long long)nr, (long long)ndst);
+	c.name = n;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, nr);
+		ggml_tensor *idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nr);
+		ggml_tensor *tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, ndst);
+		return ggml_get_rows_back(ctx, a, idx, tmpl);
+	};
+	c.init = [=](ggml_tensor *t, std::mt19937 &rng) {
+		if (t->type != GGML_TYPE_I32) {
+			return false;
+		}
+		int32_t *d = reinterpret_cast<int32_t *>(t->data);
+		for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+			d[i] = int32_t(rng() % uint32_t(ndst));
+		}
+		return true;
+	};
+	out.push_back(c);
+}
 } // namespace
 L2_CASES(loss) {
+	add_get_rows_back(out, 8, 6, 4);
+	add_get_rows_back(out, 5, 40, 3);
+	add_get_rows_back(out, 33, 17, 64);
+	add_get_rows_back(out, 1, 9, 9);
+	add_get_rows_back(out, 64, 300, 10);
 	add_repeat_back(out, { 4, 5, 3, 2 }, { 2, 1, 1, 1 });
 	add_repeat_back(out, { 4, 5, 3, 2 }, { 1, 3, 1, 1 });
 	add_repeat_back(out, { 4, 5, 3, 2 }, { 2, 2, 2, 2 });

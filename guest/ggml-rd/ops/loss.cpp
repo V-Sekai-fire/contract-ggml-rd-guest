@@ -1,4 +1,4 @@
-// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK, SOFT_MAX_BACK, RMS_NORM_BACK and REPEAT_BACK, f32.
+// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK, SOFT_MAX_BACK, RMS_NORM_BACK, REPEAT_BACK and GET_ROWS_BACK, f32.
 //
 // The kernel is lean/Ggml/SlangCodegen/Loss.lean (ce_loss_f32 and its
 // _serial sibling for the host tests): one 256-thread work group, thread t
@@ -176,6 +176,29 @@ bool pack_repeat_back(Pack &p) {
 	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nelements(p.node)));
 }
 
+// GET_ROWS_BACK: src0 f32 [nc, nr] rows, src1 the nr i32 indices (a vector), dst f32 [nc, ndst], the
+// shape of src2 (ggml_get_rows_back's c). ggml-cpu asserts dst contiguous and src0 nb0 = 4. An index
+// outside [0, ndst) is not defined there, so the host must supply valid ones. One thread per dst element.
+bool supports_get_rows_back(const ggml_tensor *op) {
+	const ggml_tensor *a = op->src[0];
+	const ggml_tensor *r = op->src[1];
+	if (a == nullptr || r == nullptr || op->src[2] != nullptr || r->type != GGML_TYPE_I32) {
+		return false;
+	}
+	if (op->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || !ggml_is_matrix(a) || !ggml_is_vector(r)) {
+		return false;
+	}
+	if (op->ne[0] != a->ne[0] || op->ne[2] != 1 || op->ne[3] != 1 || a->nb[0] != sizeof(float) || !ggml_is_contiguous(op)) {
+		return false;
+	}
+	return tensor_fits(op) && tensor_fits(a) && tensor_fits(r);
+}
+
+bool pack_get_rows_back(Pack &p) {
+	p.kernel = kernel_index("get_rows_back_f32");
+	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nelements(p.node)));
+}
+
 } // namespace
 
 GGML_RD_OP(ce_loss_f32, GGML_OP_CROSS_ENTROPY_LOSS, -1, supports_ce_loss, pack_ce_loss);
@@ -184,3 +207,4 @@ GGML_RD_OP(silu_back_f32, GGML_OP_SILU_BACK, -1, supports_silu_back, pack_silu_b
 GGML_RD_OP(soft_max_back_f32, GGML_OP_SOFT_MAX_BACK, -1, supports_soft_max_back, pack_soft_max_back);
 GGML_RD_OP(rms_norm_back_f32, GGML_OP_RMS_NORM_BACK, -1, supports_rms_norm_back, pack_rms_norm_back);
 GGML_RD_OP(repeat_back_f32, GGML_OP_REPEAT_BACK, -1, supports_repeat_back, pack_repeat_back);
+GGML_RD_OP(get_rows_back_f32, GGML_OP_GET_ROWS_BACK, -1, supports_get_rows_back, pack_get_rows_back);
