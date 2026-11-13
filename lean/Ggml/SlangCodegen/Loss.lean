@@ -211,6 +211,35 @@ def rmsBackBody : List SlangStmt :=
 def rmsBackF32 : SlangShaderModule :=
   kernelModule .float .float .uint .float [fnPw, fnPf, fnOff4] (entry1D threadgroup rmsBackBody)
 
+/-- `ggml_repeat_back(a, b)`: dst has b's shape `(ne0..ne3)`, `a` is `nr0..nr3` repeats of it per
+    dimension, and `dst[k] = Σ a[i·ne + k]` over every repeat index. One thread per dst element, the
+    sum in ggml-cpu's loop order (i3 outermost, then i2, i1, i0 innermost), each term one f32 add onto
+    a zero start, so it is bit-exact against ggml-cpu. -/
+def repeatBackBody : List SlangStmt :=
+  let ne (k : Nat) : SlangExpr := pwN (wDst + tNe + k)
+  let sne (k : Nat) : SlangExpr := pwN (wSrc 0 + tNe + k)
+  let nb (k : Nat) : SlangExpr := pwN (wSrc 0 + tNb + k)
+  let loop (i : String) (n : SlangExpr) (inner : List SlangStmt) : List SlangStmt :=
+    [ .declInit ui i (u 0), .whileLoop (lt (v i) n) (inner ++ [inc i]) ]
+  [ .decl ui "k0", .decl ui "k1", .decl ui "k2", .decl ui "k3"
+  , .expr (.call "unravel4" [v "e", u wDst, v "k0", v "k1", v "k2", v "k3"])
+  , .declInit ui "d" (.call "off4" [u wDst, v "k0", v "k1", v "k2", v "k3"])
+  , .declInit fl "acc" (fLit 0.0) ] ++
+  loop "i3" (udiv (sne 3) (ne 3)) (
+    loop "i2" (udiv (sne 2) (ne 2)) (
+      loop "i1" (udiv (sne 1) (ne 1)) (
+        loop "i0" (udiv (sne 0) (ne 0))
+          [ .assign (v "acc") (add (v "acc") (.index (v "s0")
+              (add (add (add (add (pwN (wSrc 0 + tOff))
+                (mul (add (mul (v "i0") (ne 0)) (v "k0")) (nb 0)))
+                (mul (add (mul (v "i1") (ne 1)) (v "k1")) (nb 1)))
+                (mul (add (mul (v "i2") (ne 2)) (v "k2")) (nb 2)))
+                (mul (add (mul (v "i3") (ne 3)) (v "k3")) (nb 3)))) ) ]))) ++
+  [ .assign (.index (v "dst") (v "d")) (v "acc") ]
+
+def repeatBackF32 : SlangShaderModule :=
+  kernelModule .float .float .uint .float [fnPw, fnUnravel4, fnOff4] (entry1D threadgroup repeatBackBody)
+
 def ceLossBackF32 : SlangShaderModule :=
   kernelModule .float .float .float .float [fnPw, fnOff4] (entry1D threadgroup backBody)
 
@@ -223,6 +252,7 @@ def kernels : List (String × SlangShaderModule) :=
   , ("ce_loss_back_f32", ceLossBackF32)
   , ("silu_back_f32", siluBackF32)
   , ("soft_max_back_f32", smBackF32)
-  , ("rms_norm_back_f32", rmsBackF32) ]
+  , ("rms_norm_back_f32", rmsBackF32)
+  , ("repeat_back_f32", repeatBackF32) ]
 
 end Ggml.SlangCodegen.Loss

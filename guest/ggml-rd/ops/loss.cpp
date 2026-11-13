@@ -1,4 +1,4 @@
-// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK, SOFT_MAX_BACK and RMS_NORM_BACK, f32.
+// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK, SOFT_MAX_BACK, RMS_NORM_BACK and REPEAT_BACK, f32.
 //
 // The kernel is lean/Ggml/SlangCodegen/Loss.lean (ce_loss_f32 and its
 // _serial sibling for the host tests): one 256-thread work group, thread t
@@ -155,6 +155,27 @@ bool pack_rms_norm_back(Pack &p) {
 	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nrows(p.node)));
 }
 
+// REPEAT_BACK: src0 is nr0..nr3 repeats of dst's shape; dst[k] sums src0 over the repeats. ggml-cpu
+// needs nb0 = 4 on both, so only rows with contiguous elements. One thread per dst element.
+bool supports_repeat_back(const ggml_tensor *op) {
+	const ggml_tensor *a = op->src[0];
+	if (a == nullptr || op->src[1] != nullptr) {
+		return false;
+	}
+	if (op->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || !ggml_can_repeat(op, a)) {
+		return false;
+	}
+	if (a->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) {
+		return false;
+	}
+	return tensor_fits(op) && tensor_fits(a);
+}
+
+bool pack_repeat_back(Pack &p) {
+	p.kernel = kernel_index("repeat_back_f32");
+	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nelements(p.node)));
+}
+
 } // namespace
 
 GGML_RD_OP(ce_loss_f32, GGML_OP_CROSS_ENTROPY_LOSS, -1, supports_ce_loss, pack_ce_loss);
@@ -162,3 +183,4 @@ GGML_RD_OP(ce_loss_back_f32, GGML_OP_CROSS_ENTROPY_LOSS_BACK, -1, supports_ce_lo
 GGML_RD_OP(silu_back_f32, GGML_OP_SILU_BACK, -1, supports_silu_back, pack_silu_back);
 GGML_RD_OP(soft_max_back_f32, GGML_OP_SOFT_MAX_BACK, -1, supports_soft_max_back, pack_soft_max_back);
 GGML_RD_OP(rms_norm_back_f32, GGML_OP_RMS_NORM_BACK, -1, supports_rms_norm_back, pack_rms_norm_back);
+GGML_RD_OP(repeat_back_f32, GGML_OP_REPEAT_BACK, -1, supports_repeat_back, pack_repeat_back);

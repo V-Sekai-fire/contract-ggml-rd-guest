@@ -5,6 +5,7 @@
 // exercises every term. Logits are in [-4, 4) so the row max matters. The
 // sum is f32 in a tree where ggml-cpu sums rows in double, so the bar is
 // test-backend-ops' NMSE (1e-7), not bit equality.
+#include <array>
 #include <cstdio>
 #include "../l2.h"
 namespace {
@@ -109,8 +110,29 @@ void add_rms_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2, 
 	};
 	out.push_back(c);
 }
+
+// REPEAT_BACK(a, b): a is nr0..nr3 repeats of b's shape; the result has b's shape, summing a over the repeats.
+void add_repeat_back(std::vector<L2Case> &out, std::array<int64_t, 4> ne, std::array<int64_t, 4> nr) {
+	L2Case c;
+	char n[120];
+	std::snprintf(n, sizeof n, "REPEAT_BACK ne=[%lld,%lld,%lld,%lld] nr=[%lld,%lld,%lld,%lld]", (long long)ne[0], (long long)ne[1],
+			(long long)ne[2], (long long)ne[3], (long long)nr[0], (long long)nr[1], (long long)nr[2], (long long)nr[3]);
+	c.name = n;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * nr[0], ne[1] * nr[1], ne[2] * nr[2], ne[3] * nr[3]);
+		ggml_tensor *b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+		return ggml_repeat_back(ctx, a, b);
+	};
+	out.push_back(c);
+}
 } // namespace
 L2_CASES(loss) {
+	add_repeat_back(out, { 4, 5, 3, 2 }, { 2, 1, 1, 1 });
+	add_repeat_back(out, { 4, 5, 3, 2 }, { 1, 3, 1, 1 });
+	add_repeat_back(out, { 4, 5, 3, 2 }, { 2, 2, 2, 2 });
+	add_repeat_back(out, { 1, 1, 1, 1 }, { 8, 4, 2, 1 });
+	add_repeat_back(out, { 7, 1, 5, 1 }, { 1, 9, 1, 3 });
+	add_repeat_back(out, { 16, 8, 1, 1 }, { 1, 1, 1, 1 });
 	add_rms_back(out, 10, 5, 1, 1e-6f, 0);
 	add_rms_back(out, 32, 8, 2, 1e-5f, 0);
 	add_rms_back(out, 1000, 4, 1, 1e-6f, 0);
