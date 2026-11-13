@@ -174,6 +174,43 @@ def smBackBody : List SlangStmt :=
 def smBackF32 : SlangShaderModule :=
   kernelModule .float .float .uint .float [fnPw, fnPf, fnOff4] (entry1D threadgroup smBackBody)
 
+/-- `ggml_rms_norm_back(dz, x, eps)` (src0 `dz`, src1 `x`, `eps` = op_params[0]): per row
+    `sxx = Σ x²`, `sxdz = Σ x·dz`, `rrms = 1 / sqrt(sxx / n + eps)`,
+    `scale = -sxdz / (sxx + eps · n)`, `dx = (dz + x · scale) · rrms`, in ggml-cpu's order. One
+    thread per row, rows through `nb1`, `nb2`, `nb3` (the CPU unravels them). ggml-cpu sums in
+    double, so the match is within NMSE, not bit for bit. -/
+def rmsBackBody : List SlangStmt :=
+  let rowOff (src : Nat) (r : String) : SlangStmt :=
+    .declInit ui r (add (add (add (pwN (src + tOff)) (mul (v "i1") (pwN (src + tNb + 1))))
+      (mul (v "i2") (pwN (src + tNb + 2)))) (mul (v "i3") (pwN (src + tNb + 3))))
+  [ .declInit ui "nc" (pwN (wSrc 0 + tNe))
+  , .declInit ui "n1" (pwN (wSrc 0 + tNe + 1))
+  , .declInit ui "n2" (pwN (wSrc 0 + tNe + 2))
+  , .declInit fl "eps" (pfN wOpParams)
+  , .declInit ui "i1" (urem (v "e") (v "n1"))
+  , .declInit ui "i2" (urem (udiv (v "e") (v "n1")) (v "n2"))
+  , .declInit ui "i3" (udiv (udiv (v "e") (v "n1")) (v "n2"))
+  , rowOff (wSrc 0) "b0", rowOff (wSrc 1) "b1", rowOff wDst "bd"
+  , .declInit fl "sxx" (fLit 0.0)
+  , .declInit fl "sxdz" (fLit 0.0)
+  , .declInit ui "i" (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .declInit fl "xv" (.index (v "s1") (add (v "b1") (v "i")))
+      , .assign (v "sxx") (add (v "sxx") (mul (v "xv") (v "xv")))
+      , .assign (v "sxdz") (add (v "sxdz") (mul (v "xv") (.index (v "s0") (add (v "b0") (v "i")))))
+      , inc "i" ]
+  , .declInit fl "rrms" (fdiv (fLit 1.0) (.call "sqrt" [add (fdiv (v "sxx") (.call "float" [v "nc"])) (v "eps")]))
+  , .declInit fl "sx" (fdiv (sub (fLit 0.0) (v "sxdz")) (add (v "sxx") (mul (v "eps") (.call "float" [v "nc"]))))
+  , .assign (v "i") (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (.index (v "dst") (add (v "bd") (v "i")))
+          (mul (add (.index (v "s0") (add (v "b0") (v "i")))
+                    (mul (.index (v "s1") (add (v "b1") (v "i"))) (v "sx"))) (v "rrms"))
+      , inc "i" ] ]
+
+def rmsBackF32 : SlangShaderModule :=
+  kernelModule .float .float .uint .float [fnPw, fnPf, fnOff4] (entry1D threadgroup rmsBackBody)
+
 def ceLossBackF32 : SlangShaderModule :=
   kernelModule .float .float .float .float [fnPw, fnOff4] (entry1D threadgroup backBody)
 
@@ -185,6 +222,7 @@ def kernels : List (String × SlangShaderModule) :=
   , ("ce_loss_f32_serial", ceLossF32Serial)
   , ("ce_loss_back_f32", ceLossBackF32)
   , ("silu_back_f32", siluBackF32)
-  , ("soft_max_back_f32", smBackF32) ]
+  , ("soft_max_back_f32", smBackF32)
+  , ("rms_norm_back_f32", rmsBackF32) ]
 
 end Ggml.SlangCodegen.Loss

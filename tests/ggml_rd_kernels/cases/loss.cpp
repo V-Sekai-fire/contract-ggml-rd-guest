@@ -87,8 +87,36 @@ void add_sm_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2, f
 	};
 	out.push_back(c);
 }
+
+// RMS_NORM_BACK(dz, x, eps): rows of any strides with nb0 = 4, so a padded-row x and a permuted dz
+// are both fine (the kernel reads rows through nb1 to nb3 as ggml-cpu does).
+void add_rms_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2, float eps, int64_t pad) {
+	L2Case c;
+	char n[96];
+	std::snprintf(n, sizeof n, "RMS_NORM_BACK nc=%lld nr=%lld n2=%lld eps=%g%s", (long long)nc, (long long)nr, (long long)n2, eps,
+			pad ? " padded rows" : "");
+	c.name = n;
+	c.lo = -2.0f;
+	c.hi = 2.0f;
+	c.control_src = 1;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *dz = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, nr, n2);
+		ggml_tensor *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc + pad, nr, n2);
+		if (pad > 0) {
+			x = ggml_view_3d(ctx, x, nc, nr, n2, x->nb[1], x->nb[2], 0);
+		}
+		return ggml_rms_norm_back(ctx, dz, x, eps);
+	};
+	out.push_back(c);
+}
 } // namespace
 L2_CASES(loss) {
+	add_rms_back(out, 10, 5, 1, 1e-6f, 0);
+	add_rms_back(out, 32, 8, 2, 1e-5f, 0);
+	add_rms_back(out, 1000, 4, 1, 1e-6f, 0);
+	add_rms_back(out, 7, 300, 1, 1e-6f, 0);
+	add_rms_back(out, 64, 1, 1, 1e-6f, 0);
+	add_rms_back(out, 9, 6, 2, 1e-6f, 4);
 	add_silu_back(out, 10, 5, 4, 0);
 	add_silu_back(out, 7, 3, 5, 0);
 	add_silu_back(out, 64, 1, 1, 0);

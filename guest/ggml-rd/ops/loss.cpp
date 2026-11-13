@@ -1,4 +1,4 @@
-// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK and SOFT_MAX_BACK, f32.
+// ggml-rd ops: CROSS_ENTROPY_LOSS, CROSS_ENTROPY_LOSS_BACK, SILU_BACK, SOFT_MAX_BACK and RMS_NORM_BACK, f32.
 //
 // The kernel is lean/Ggml/SlangCodegen/Loss.lean (ce_loss_f32 and its
 // _serial sibling for the host tests): one 256-thread work group, thread t
@@ -129,9 +129,36 @@ bool pack_soft_max_back(Pack &p) {
 	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nrows(p.node)));
 }
 
+// RMS_NORM_BACK: src0 the incoming gradient, src1 the forward input, eps = op_params[0]. ggml-cpu
+// needs nb0 = 4 on both and the three one shape, and reads each row through nb1 to nb3. One thread
+// per row.
+bool supports_rms_norm_back(const ggml_tensor *op) {
+	const ggml_tensor *dz = op->src[0];
+	const ggml_tensor *x = op->src[1];
+	if (dz == nullptr || x == nullptr || op->src[2] != nullptr) {
+		return false;
+	}
+	if (op->type != GGML_TYPE_F32 || dz->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
+		return false;
+	}
+	if (!ggml_are_same_shape(dz, x) || !ggml_are_same_shape(dz, op)) {
+		return false;
+	}
+	if (dz->nb[0] != sizeof(float) || x->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) {
+		return false;
+	}
+	return ggml_nrows(dz) <= 0xFFFFFFFFll && tensor_fits(op) && tensor_fits(dz) && tensor_fits(x);
+}
+
+bool pack_rms_norm_back(Pack &p) {
+	p.kernel = kernel_index("rms_norm_back_f32");
+	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nrows(p.node)));
+}
+
 } // namespace
 
 GGML_RD_OP(ce_loss_f32, GGML_OP_CROSS_ENTROPY_LOSS, -1, supports_ce_loss, pack_ce_loss);
 GGML_RD_OP(ce_loss_back_f32, GGML_OP_CROSS_ENTROPY_LOSS_BACK, -1, supports_ce_loss_back, pack_ce_loss_back);
 GGML_RD_OP(silu_back_f32, GGML_OP_SILU_BACK, -1, supports_silu_back, pack_silu_back);
 GGML_RD_OP(soft_max_back_f32, GGML_OP_SOFT_MAX_BACK, -1, supports_soft_max_back, pack_soft_max_back);
+GGML_RD_OP(rms_norm_back_f32, GGML_OP_RMS_NORM_BACK, -1, supports_rms_norm_back, pack_rms_norm_back);

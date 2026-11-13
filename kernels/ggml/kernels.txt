@@ -123,3 +123,4 @@ ce_loss_f32_serial
 ce_loss_back_f32
 silu_back_f32
 soft_max_back_f32
+rms_norm_back_f32

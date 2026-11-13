@@ -136,6 +136,7 @@ static const KernelDesc kKernels[] = {
 	{ "ce_loss_back_f32", { 256, 1, 1 } },
 	{ "silu_back_f32", { 256, 1, 1 } },
 	{ "soft_max_back_f32", { 256, 1, 1 } },
+	{ "rms_norm_back_f32", { 256, 1, 1 } },
 };
 static const uint32_t kKernelCount = sizeof(kKernels) / sizeof(kKernels[0]);
 
