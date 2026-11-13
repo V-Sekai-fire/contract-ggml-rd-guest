@@ -24,6 +24,7 @@ import Ggml.SlangCodegen.Reduce
 import Ggml.SlangCodegen.Pool
 import Ggml.SlangCodegen.Argsort
 import Ggml.SlangCodegen.Set
+import Ggml.SlangCodegen.OptStep
 import Ggml.SlangCodegen.ConvDw
 import Ggml.SlangCodegen.UnarySeeThrough
 import Ggml.SlangCodegen.Glu
@@ -68,6 +69,7 @@ def kernels : List (String × LeanSlang.SlangShaderModule) :=
   ++ Ggml.SlangCodegen.Pool.kernels
   ++ Ggml.SlangCodegen.Argsort.kernels
   ++ Ggml.SlangCodegen.Set.kernels
+  ++ Ggml.SlangCodegen.OptStep.kernels
   ++ Ggml.SlangCodegen.ConvDw.kernels
   ++ Ggml.SlangCodegen.UnarySeeThrough.kernels
   ++ Ggml.SlangCodegen.Glu.kernels

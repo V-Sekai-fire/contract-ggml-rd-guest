@@ -130,6 +130,7 @@ static const KernelDesc kKernels[] = {
 	{ "cmp_le_xla_f32", { 256, 1, 1 } },
 	{ "cmp_eq_xla_f32", { 256, 1, 1 } },
 	{ "cmp_ne_xla_f32", { 256, 1, 1 } },
+	{ "opt_step_sgd_f32", { 256, 1, 1 } },
 };
 static const uint32_t kKernelCount = sizeof(kKernels) / sizeof(kKernels[0]);
 
