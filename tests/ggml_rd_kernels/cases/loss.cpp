@@ -48,8 +48,58 @@ void add_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2) {
 	};
 	out.push_back(c);
 }
+
+// SILU_BACK(dy, x): elementwise, so shapes with odd sizes and an x with padded rows (the kernel
+// reads every source through its own strides, rows at nb1). Both inputs uniform in [-4, 4).
+void add_silu_back(std::vector<L2Case> &out, int64_t a, int64_t b, int64_t c3, int64_t pad) {
+	L2Case c;
+	char n[96];
+	std::snprintf(n, sizeof n, "SILU_BACK [%lld,%lld,%lld]%s", (long long)a, (long long)b, (long long)c3, pad ? " padded rows" : "");
+	c.name = n;
+	c.lo = -4.0f;
+	c.hi = 4.0f;
+	c.control_src = 1;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *dy = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, c3);
+		ggml_tensor *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a + pad, b, c3);
+		if (pad > 0) { // x: rows `pad` columns wider, so nb1 is not ne0 * 4
+			x = ggml_view_3d(ctx, x, a, b, c3, x->nb[1], x->nb[2], 0);
+		}
+		return ggml_silu_back(ctx, dy, x);
+	};
+	out.push_back(c);
+}
+
+// SOFT_MAX_BACK(dy, y, scale): y is a softmax output in the training use, but the backward is
+// defined for any y, so the uniform fill is valid. Contiguous only, as ggml-cpu asserts.
+void add_sm_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2, float scale) {
+	L2Case c;
+	char n[96];
+	std::snprintf(n, sizeof n, "SOFT_MAX_BACK nc=%lld nr=%lld n2=%lld scale=%g", (long long)nc, (long long)nr, (long long)n2, scale);
+	c.name = n;
+	c.lo = -1.0f;
+	c.hi = 1.0f;
+	c.value_blind = false;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *dy = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, nr, n2);
+		ggml_tensor *y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, nr, n2);
+		return ggml_soft_max_ext_back(ctx, dy, y, scale, 0.0f);
+	};
+	out.push_back(c);
+}
 } // namespace
 L2_CASES(loss) {
+	add_silu_back(out, 10, 5, 4, 0);
+	add_silu_back(out, 7, 3, 5, 0);
+	add_silu_back(out, 64, 1, 1, 0);
+	add_silu_back(out, 6, 4, 3, 5);
+	add_silu_back(out, 1280, 16, 1, 0);
+	add_sm_back(out, 10, 1, 1, 1.0f);
+	add_sm_back(out, 10, 5, 1, 1.0f);
+	add_sm_back(out, 32, 8, 2, 0.125f);
+	add_sm_back(out, 1000, 4, 1, 1.0f);
+	add_sm_back(out, 7, 300, 1, 0.5f);
+	add_sm_back(out, 1, 17, 1, 1.0f);
 	add_back(out, 10, 1, 1);
 	add_back(out, 10, 5, 1);
 	add_back(out, 32, 8, 2);

@@ -121,3 +121,5 @@ opt_step_sgd_f32
 ce_loss_f32
 ce_loss_f32_serial
 ce_loss_back_f32
+silu_back_f32
+soft_max_back_f32

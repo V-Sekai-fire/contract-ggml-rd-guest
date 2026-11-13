@@ -129,6 +129,51 @@ def backBody : List SlangStmt :=
                     (.index (v "s2") (add (v "b2") (v "i")))) (v "dn"))
       , inc "i" ] ]
 
+/-! ## SILU_BACK and SOFT_MAX_BACK -/
+
+/-- `ggml_silu_back(dy, x)` (src0 `dy`, src1 `x`, one shape, both through their own strides):
+    `s = 1 / (1 + exp(-x))`, `dx = dy · s · (1 + x · (1 - s))`, ggml-cpu's
+    `ggml_silu_backward_f32` in its order. -/
+def siluBackBody : List SlangStmt :=
+  [ .decl ui "i0", .decl ui "i1", .decl ui "i2", .decl ui "i3"
+  , .expr (.call "unravel4" [v "e", u wDst, v "i0", v "i1", v "i2", v "i3"])
+  , .declInit ui "d" (.call "off4" [u wDst, v "i0", v "i1", v "i2", v "i3"])
+  , .declInit ui "a" (.call "off4" [u (wSrc 0), v "i0", v "i1", v "i2", v "i3"])
+  , .declInit ui "b" (.call "off4" [u (wSrc 1), v "i0", v "i1", v "i2", v "i3"])
+  , .declInit fl "x" (.index (v "s1") (v "b"))
+  , .declInit fl "s" (fdiv (fLit 1.0) (add (fLit 1.0) (.call "exp" [sub (fLit 0.0) (v "x")])))
+  , .assign (.index (v "dst") (v "d"))
+      (mul (mul (.index (v "s0") (v "a")) (v "s"))
+           (add (fLit 1.0) (mul (v "x") (sub (fLit 1.0) (v "s"))))) ]
+
+def siluBackF32 : SlangShaderModule :=
+  kernelModule .float .float .uint .float [fnPw, fnUnravel4, fnOff4] (entry1D threadgroup siluBackBody)
+
+/-- `ggml_soft_max_ext_back(dy, y)` (src0 `dy`, src1 `y`, `scale` = op_params[0], `max_bias` 0):
+    per row `dot = Σ y·dy`, `dx = (dy - dot) · y · scale`. One thread per row, rows through `nb1`.
+    ggml-cpu's `ggml_vec_dot_f32` sums in SIMD lanes, so the match is within NMSE, not bit for bit. -/
+def smBackBody : List SlangStmt :=
+  [ .declInit ui "nc" (pwN (wSrc 0 + tNe))
+  , .declInit fl "scale" (pfN wOpParams)
+  , .declInit ui "b0" (add (pwN (wSrc 0 + tOff)) (mul (v "e") (pwN (wSrc 0 + tNb + 1))))
+  , .declInit ui "b1" (add (pwN (wSrc 1 + tOff)) (mul (v "e") (pwN (wSrc 1 + tNb + 1))))
+  , .declInit ui "bd" (add (pwN (wDst + tOff)) (mul (v "e") (pwN (wDst + tNb + 1))))
+  , .declInit fl "dot" (fLit 0.0)
+  , .declInit ui "i" (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (v "dot") (add (v "dot")
+          (mul (.index (v "s1") (add (v "b1") (v "i"))) (.index (v "s0") (add (v "b0") (v "i")))))
+      , inc "i" ]
+  , .assign (v "i") (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (.index (v "dst") (add (v "bd") (v "i")))
+          (mul (mul (sub (.index (v "s0") (add (v "b0") (v "i"))) (v "dot"))
+                    (.index (v "s1") (add (v "b1") (v "i")))) (v "scale"))
+      , inc "i" ] ]
+
+def smBackF32 : SlangShaderModule :=
+  kernelModule .float .float .uint .float [fnPw, fnPf, fnOff4] (entry1D threadgroup smBackBody)
+
 def ceLossBackF32 : SlangShaderModule :=
   kernelModule .float .float .float .float [fnPw, fnOff4] (entry1D threadgroup backBody)
 
@@ -138,6 +183,8 @@ def ceLossF32Serial : SlangShaderModule := module threadgroup .ser
 def kernels : List (String × SlangShaderModule) :=
   [ ("ce_loss_f32", ceLossF32)
   , ("ce_loss_f32_serial", ceLossF32Serial)
-  , ("ce_loss_back_f32", ceLossBackF32) ]
+  , ("ce_loss_back_f32", ceLossBackF32)
+  , ("silu_back_f32", siluBackF32)
+  , ("soft_max_back_f32", smBackF32) ]
 
 end Ggml.SlangCodegen.Loss
