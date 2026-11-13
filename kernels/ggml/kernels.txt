@@ -118,3 +118,5 @@ cmp_le_xla_f32
 cmp_eq_xla_f32
 cmp_ne_xla_f32
 opt_step_sgd_f32
+ce_loss_f32
+ce_loss_f32_serial
