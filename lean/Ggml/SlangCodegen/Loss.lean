@@ -98,11 +98,46 @@ def module (tg : Nat) (var : Variant) : SlangShaderModule :=
   | .par => { m with groupShared := [ { name := "sh", elemType := fl, dims := [tg] } ] }
   | .ser => m
 
+/-! ## CROSS_ENTROPY_LOSS_BACK: one thread per row -/
+
+/-- `ggml_cross_entropy_loss_back(g, x, y)`: dst, shaped like `x`, is
+    `(softmax(x) - y) · g / nr` per row, with `g` the one-element gradient in
+    src0, `x` in src1 and `y` in src2. One thread per row, in ggml-cpu's order:
+    `exp(x - mx)` scaled by the reciprocal of its sum, minus the label, times
+    `g / float(nr)`. Rows are found through `nb1` as in the forward kernel. -/
+def backBody : List SlangStmt :=
+  let xAt1 : SlangExpr := .index (v "s1") (add (v "b1") (v "i"))
+  [ .declInit ui "nc" (pwN (wSrc 1 + tNe))
+  , .declInit ui "nr" (mul (mul (pwN (wSrc 1 + tNe + 1)) (pwN (wSrc 1 + tNe + 2))) (pwN (wSrc 1 + tNe + 3)))
+  , .declInit ui "b1" (add (pwN (wSrc 1 + tOff)) (mul (v "e") (pwN (wSrc 1 + tNb + 1))))
+  , .declInit ui "b2" (add (pwN (wSrc 2 + tOff)) (mul (v "e") (pwN (wSrc 2 + tNb + 1))))
+  , .declInit ui "bd" (add (pwN (wDst + tOff)) (mul (v "e") (pwN (wDst + tNb + 1))))
+  , .declInit fl "dn" (fdiv (.index (v "s0") (pwN (wSrc 0 + tOff))) (.call "float" [v "nr"]))
+  , .declInit fl "mx" negInf
+  , .declInit ui "i" (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (v "mx") (.call "max" [v "mx", xAt1]), inc "i" ]
+  , .declInit fl "se" (fLit 0.0)
+  , .assign (v "i") (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (v "se") (add (v "se") (.call "exp" [sub xAt1 (v "mx")])), inc "i" ]
+  , .declInit fl "inv" (fdiv (fLit 1.0) (v "se"))
+  , .assign (v "i") (u 0)
+  , .whileLoop (lt (v "i") (v "nc"))
+      [ .assign (.index (v "dst") (add (v "bd") (v "i")))
+          (mul (sub (mul (.call "exp" [sub xAt1 (v "mx")]) (v "inv"))
+                    (.index (v "s2") (add (v "b2") (v "i")))) (v "dn"))
+      , inc "i" ] ]
+
+def ceLossBackF32 : SlangShaderModule :=
+  kernelModule .float .float .float .float [fnPw, fnOff4] (entry1D threadgroup backBody)
+
 def ceLossF32 : SlangShaderModule := module threadgroup .par
 def ceLossF32Serial : SlangShaderModule := module threadgroup .ser
 
 def kernels : List (String × SlangShaderModule) :=
   [ ("ce_loss_f32", ceLossF32)
-  , ("ce_loss_f32_serial", ceLossF32Serial) ]
+  , ("ce_loss_f32_serial", ceLossF32Serial)
+  , ("ce_loss_back_f32", ceLossBackF32) ]
 
 end Ggml.SlangCodegen.Loss

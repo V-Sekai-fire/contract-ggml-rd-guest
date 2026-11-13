@@ -28,8 +28,35 @@ void add(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2, int64_t p
 	};
 	out.push_back(c);
 }
+
+// CROSS_ENTROPY_LOSS_BACK: ggml-cpu asserts every tensor contiguous, so no padded cases. The gradient
+// is a one-element leaf, uniform in [lo, hi) like the rest. The swap control acts on the logits (src1).
+void add_back(std::vector<L2Case> &out, int64_t nc, int64_t nr, int64_t n2) {
+	L2Case c;
+	char b[96];
+	std::snprintf(b, sizeof b, "CROSS_ENTROPY_LOSS_BACK nc=%lld nr=%lld n2=%lld", (long long)nc, (long long)nr, (long long)n2);
+	c.name = b;
+	c.value_blind = nc == 1; // one column: softmax is 1 whatever the logits are
+	c.control_src = 1;
+	c.lo = -4.0f;
+	c.hi = 4.0f;
+	c.build = [=](ggml_context *ctx) {
+		ggml_tensor *g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+		ggml_tensor *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, nr, n2);
+		ggml_tensor *y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, nr, n2);
+		return ggml_cross_entropy_loss_back(ctx, g, x, y);
+	};
+	out.push_back(c);
+}
 } // namespace
 L2_CASES(loss) {
+	add_back(out, 10, 1, 1);
+	add_back(out, 10, 5, 1);
+	add_back(out, 32, 8, 2);
+	add_back(out, 1000, 4, 1);
+	add_back(out, 7, 300, 1);
+	add_back(out, 5, 257, 3);
+	add_back(out, 1, 17, 1);
 	add(out, 10, 1, 1);
 	add(out, 10, 5, 1);
 	add(out, 32, 8, 2);

@@ -1,4 +1,4 @@
-// ggml-rd op: CROSS_ENTROPY_LOSS, f32 (ggml_cross_entropy_loss).
+// ggml-rd ops: CROSS_ENTROPY_LOSS and CROSS_ENTROPY_LOSS_BACK, f32.
 //
 // The kernel is lean/Ggml/SlangCodegen/Loss.lean (ce_loss_f32 and its
 // _serial sibling for the host tests): one 256-thread work group, thread t
@@ -44,6 +44,34 @@ bool pack_ce_loss(Pack &p) {
 	return grid_1d(p, kernel_desc(p.kernel).threadgroup[0]);
 }
 
+// CROSS_ENTROPY_LOSS_BACK: src0 the one-element gradient, src1 the logits, src2 the labels, dst
+// shaped like the logits. ggml-cpu asserts all four contiguous, so the packer does too. One thread
+// per row of the flattened dims 1 to 3 (ce_loss_back_f32).
+bool supports_ce_loss_back(const ggml_tensor *op) {
+	const ggml_tensor *g = op->src[0];
+	const ggml_tensor *x = op->src[1];
+	const ggml_tensor *y = op->src[2];
+	if (g == nullptr || x == nullptr || y == nullptr || op->src[3] != nullptr) {
+		return false;
+	}
+	if (op->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32) {
+		return false;
+	}
+	if (ggml_nelements(g) != 1 || !ggml_are_same_shape(x, y) || !ggml_are_same_shape(x, op)) {
+		return false;
+	}
+	if (!ggml_is_contiguous(x) || !ggml_is_contiguous(y) || !ggml_is_contiguous(op) || !ggml_is_contiguous(g)) {
+		return false;
+	}
+	return ggml_nelements(x) <= 0xFFFFFFFFll && tensor_fits(op) && tensor_fits(g) && tensor_fits(x) && tensor_fits(y);
+}
+
+bool pack_ce_loss_back(Pack &p) {
+	p.kernel = kernel_index("ce_loss_back_f32");
+	return p.kernel >= 0 && grid_1d(p, uint64_t(ggml_nrows(p.node)));
+}
+
 } // namespace
 
 GGML_RD_OP(ce_loss_f32, GGML_OP_CROSS_ENTROPY_LOSS, -1, supports_ce_loss, pack_ce_loss);
+GGML_RD_OP(ce_loss_back_f32, GGML_OP_CROSS_ENTROPY_LOSS_BACK, -1, supports_ce_loss_back, pack_ce_loss_back);
