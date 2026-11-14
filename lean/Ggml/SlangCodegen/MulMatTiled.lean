@@ -311,7 +311,7 @@ example : LeanSlang.emit (shader .f16 .f32) = expected := by native_decide
     helpers only. -/
 example : ∀ p ∈ pairs, LeanSlang.emit (shader p.1 p.2) = retype expected p.1 p.2 := by native_decide
 example : (kernels.map Prod.fst) =
-    ["mul_mat_tiled_f32_f32", "mul_mat_tiled_f16_f32", "mul_mat_tiled_bf16_f32", "mul_mat_tiled_f16_f16"] := by
+    ["mul_mat_tiled_f32_f32", "mul_mat_tiled_f16_f32", "mul_mat_tiled_bf16_f32", "mul_mat_tiled_f16_f16", "mul_mat_tiled_q4_0_f32"] := by
   native_decide
 
 end Ggml.SlangCodegen.MulMatTiled

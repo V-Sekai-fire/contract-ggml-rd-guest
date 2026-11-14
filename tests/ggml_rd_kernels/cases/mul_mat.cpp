@@ -110,7 +110,7 @@ ggml_tensor *rr_scores(ggml_context *ctx) {
 } // namespace
 
 L2_CASES(mul_mat) {
-	const ggml_type F32 = GGML_TYPE_F32, F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16;
+	const ggml_type F32 = GGML_TYPE_F32, F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16, Q4_0 = GGML_TYPE_Q4_0;
 	// f32 x f32
 	add(out, mm(F32, F32, 16, 16, 256), " tiled");
 	add(out, mm(F32, F32, 16, 1, 256, { 3, 2 }, { 2, 2 }), " vec, broadcast in dims 2 and 3");
@@ -133,6 +133,11 @@ L2_CASES(mul_mat) {
 	add(out, mm(BF16, F32, 65, 67, 17), " one past the tile on every side");
 	add(out, mm(BF16, F32, 129, 3, 33, { 2, 1 }, { 2, 1 }), " vec, broadcast");
 	add(out, mm(BF16, F32, 192, 130, 96), " Pixal3D block, scaled (1536 x 4608 x 4096)");
+	// q4_0 x f32: ggml-cpu quantizes src1 to q8_0, so the reference carries that rounding (nmse ~1e-5)
+	add(out, mm(Q4_0, F32, 64, 1, 32), " vec, one block");
+	add(out, mm(Q4_0, F32, 129, 3, 96, { 2, 1 }, { 2, 1 }), " vec, broadcast");
+	add(out, mm(Q4_0, F32, 65, 67, 64), " tiled, one past the tile on every side");
+	add(out, mm(Q4_0, F32, 192, 130, 96), " tiled, Pixal3D block scaled (1536 x 4608 x 4096)");
 	// f16 x f16
 	add(out, mm(F16, F16, 64, 77, 77, { 2, 1 }), " tiled");
 	add(out, mm(F16, F16, 16, 1, 256, { 3, 2 }, { 2, 2 }), " vec, broadcast");

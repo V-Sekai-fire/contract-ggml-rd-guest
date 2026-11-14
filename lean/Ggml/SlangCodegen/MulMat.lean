@@ -40,12 +40,14 @@ inductive Ty
   | f32
   | f16
   | bf16
+  | q4_0
 deriving Repr, BEq, DecidableEq, Inhabited
 
 def Ty.name : Ty → String
   | .f32 => "f32"
   | .f16 => "f16"
   | .bf16 => "bf16"
+  | .q4_0 => "q4_0"
 
 /-- The element type a binding of this operand type is declared with. -/
 def Ty.scalar : Ty → Scalar
@@ -57,7 +59,7 @@ def Ty.scalar : Ty → Scalar
     nothing ggml-cpu cannot check (it refuses `f32 × f16` and
     `bf16 × f16`). -/
 def pairs : List (Ty × Ty) :=
-  [(.f32, .f32), (.f16, .f32), (.bf16, .f32), (.f16, .f16)]
+  [(.f32, .f32), (.f16, .f32), (.bf16, .f32), (.f16, .f16), (.q4_0, .f32)]
 
 /-- Kernel name suffix, `<src0>_<src1>`. -/
 def suffix (a b : Ty) : String := a.name ++ "_" ++ b.name
@@ -69,6 +71,10 @@ def wR3 : Nat := 56
 def wRowGroupsX : Nat := 57
 
 example : wDerived + 2 = wR2 ∧ wR3 + 1 = wRowGroupsX ∧ wRowGroupsX < wordsPerSlot := by native_decide
+
+/-- A Q4_0 src0's byte offset in its buffer (its offset word is 0; `lda` adds this to each block's
+    byte address, because the offset need not be a multiple of the 18-byte block). -/
+def wQBase0 : Nat := 53
 
 /-! ## Load helpers: `float lda(uint e)` (s0) and `float ldb(uint e)` (s1) -/
 
@@ -84,6 +90,26 @@ def fnLoad (name buf : String) : Ty → SlangFunctionDecl
     , body := [ .ret (some (.index (v buf) (v "e"))) ] }
   | .f16 => { fnLdF16 buf with name := name }
   | .bf16 => { fnLdBf16 buf with name := name }
+  | .q4_0 =>
+    -- Element `e` of a Q4_0 tensor (blocks of 32: an f16 scale `d`, then 16 bytes holding
+    -- element w in the low nibble of byte w for w < 16 and the high nibble of byte w - 16
+    -- otherwise): `(nibble - 8) * d`, as ggml's dequantize_row_q4_0.
+    { retType := .scalar .float
+    , name := name
+    , params := [uintParam "e"]
+    , body :=
+        [ .declInit (.scalar .uint) "blk" (.bin ">>" (v "e") (u 5))
+        , .declInit (.scalar .uint) "w" (.bin "&" (v "e") (u 31))
+        , .declInit (.scalar .uint) "bo" (.bin "+" (.bin "*" (v "blk") (u 18)) (.call "pw" [u wQBase0]))
+        , .declInit (.scalar .uint) "dh"
+            (.bin "&" (.bin ">>" (.index (v buf) (.bin ">>" (v "bo") (u 2))) (.bin "*" (.bin "&" (v "bo") (u 2)) (u 8))) (u 65535))
+        , .declInit (.scalar .uint) "qo" (.bin "+" (.bin "+" (v "bo") (u 2)) (.bin "&" (v "w") (u 15)))
+        , .declInit (.scalar .uint) "qb"
+            (.bin "&" (.bin ">>" (.index (v buf) (.bin ">>" (v "qo") (u 2))) (.bin "*" (.bin "&" (v "qo") (u 3)) (u 8))) (u 255))
+        , .declInit (.scalar .uint) "nib"
+            (.ternary (.bin "<" (v "w") (u 16)) (.bin "&" (v "qb") (u 15)) (.bin ">>" (v "qb") (u 4)))
+        , .ret (some (.bin "*" (.bin "-" (.call "float" [v "nib"]) (.litFloatExact 8.0))
+            (.call "f16_bits_to_f32" [v "dh"]))) ] }
 
 def fnLda (a : Ty) : SlangFunctionDecl := fnLoad "lda" "s0" a
 def fnLdb (b : Ty) : SlangFunctionDecl := fnLoad "ldb" "s1" b
@@ -179,7 +205,7 @@ def store (i j x : SlangExpr) : SlangStmt :=
     `-preserve-params`). -/
 def module (a b : Ty) (groupShared : List SlangGroupSharedDecl) (main : SlangFunctionDecl) :
     SlangShaderModule :=
-  { kernelModule a.scalar b.scalar .uint .float [fnPw, fnLda a, fnLdb b] main with groupShared := groupShared }
+  { kernelModule a.scalar b.scalar .uint .float ([fnPw] ++ (if a == .q4_0 then [fnF16BitsToF32] else []) ++ [fnLda a, fnLdb b]) main with groupShared := groupShared }
 
 /-- The compute entry: `numthreads(x, y, 1)`, group id and thread id. -/
 def entry (x y : Nat) (body : List SlangStmt) : SlangFunctionDecl :=
@@ -195,11 +221,15 @@ def declText (a b : Ty) : String :=
   "RWStructuredBuffer<" ++ emitScalar a.scalar ++ "> s0;\n[[vk::binding(2, 0)]]\nRWStructuredBuffer<"
     ++ emitScalar b.scalar ++ "> s1;"
 
+/-- The load helper `lda` as emitted, with the helper it calls when it has one. -/
+def ldaText (a : Ty) : String :=
+  if a == .q4_0 then emitFunction fnF16BitsToF32 ++ "\n\n" ++ emitFunction (fnLda a) else emitFunction (fnLda a)
+
 /-- A module's text for (a, b), from its f16 × f32 text: the two buffer
     declarations and the two load helpers are all that differ. -/
 def retype (t : String) (a b : Ty) : String :=
   ((t.replace (declText .f16 .f32) (declText a b)).replace
-      (emitFunction (fnLda .f16)) (emitFunction (fnLda a))).replace
+      (emitFunction (fnLda .f16)) (ldaText a)).replace
     (emitFunction (fnLdb .f32)) (emitFunction (fnLdb b))
 
 end Ggml.SlangCodegen.MulMat

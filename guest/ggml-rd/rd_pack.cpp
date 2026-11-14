@@ -112,36 +112,63 @@ bool tensor_fits(const ggml_tensor *t) {
 	return last <= 0xFFFFFFFFull && uint64_t(ggml_nelements(t)) <= 0xFFFFFFFFull;
 }
 
+bool tensor_fits_q4_0(const ggml_tensor *t) {
+	if (t == nullptr || t->type != GGML_TYPE_Q4_0 || t->ne[0] % ggml_blck_size(t->type) != 0) {
+		return false;
+	}
+	const size_t ts = ggml_type_size(t->type);
+	const uint64_t blck = uint64_t(ggml_blck_size(t->type));
+	uint64_t last = 0; // the largest element index the tensor reaches
+	for (int k = 0; k < 4; ++k) {
+		if (t->ne[k] < 1 || uint64_t(t->ne[k]) > 0xFFFFFFFFull || t->nb[k] % ts != 0) {
+			return false;
+		}
+		const uint64_t nb = k == 0 ? t->nb[k] / ts : t->nb[k] / ts * blck;
+		if (nb > 0xFFFFFFFFull) {
+			return false;
+		}
+		last += uint64_t(t->ne[k] - 1) * nb;
+	}
+	return last <= 0xFFFFFFFFull && uint64_t(ggml_nelements(t)) <= 0xFFFFFFFFull;
+}
+
 namespace {
 
-// One tensor block: ne, nb and offset, in elements (in bytes for a
-// block-quantized type).
+// One tensor block: ne, nb and offset, in elements. A block-quantized src0 (Q4_0) keeps nb in elements
+// (nb0 / type_size, the rest nb / type_size * block_size) and its byte offset in word 53.
+constexpr uint32_t W_QBASE0 = 53; // MulMat.wQBase0
+
 bool fill_block(uint32_t *w, uint32_t at, const ggml_tensor *t, uint64_t off) {
 	const size_t ts = ggml_type_size(t->type);
-	const bool elems = ggml_blck_size(t->type) == 1;
+	const uint64_t blck = uint64_t(ggml_blck_size(t->type));
 	for (int k = 0; k < 4; ++k) {
 		if (t->ne[k] < 0 || uint64_t(t->ne[k]) > 0xFFFFFFFFull) {
 			return false;
 		}
 		w[at + T_NE + k] = uint32_t(t->ne[k]);
 		uint64_t nb = uint64_t(t->nb[k]);
-		if (elems) {
-			if (nb % ts != 0) {
-				return false;
-			}
-			nb /= ts;
+		if (nb % ts != 0) {
+			return false;
 		}
+		nb = k == 0 ? nb / ts : nb / ts * blck; // a block is one nb0 step but blck elements
 		if (nb > 0xFFFFFFFFull) {
 			return false;
 		}
 		w[at + T_NB + k] = uint32_t(nb);
 	}
-	if (elems) {
-		if (off % ts != 0) {
+	if (blck != 1) {
+		// The byte offset of a block-quantized source is word 53, and its offset word stays 0.
+		if (at != W_SRC0 || off > 0xFFFFFFFFull) {
 			return false;
 		}
-		off /= ts;
+		w[W_QBASE0] = uint32_t(off);
+		w[at + T_OFF] = 0;
+		return true;
 	}
+	if (off % ts != 0) {
+		return false;
+	}
+	off = off / ts;
 	if (off > 0xFFFFFFFFull) {
 		return false;
 	}

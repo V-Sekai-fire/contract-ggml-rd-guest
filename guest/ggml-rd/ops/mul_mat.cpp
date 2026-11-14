@@ -43,6 +43,8 @@ const char *type_tag(ggml_type t) {
 			return "f16";
 		case GGML_TYPE_BF16:
 			return "bf16";
+		case GGML_TYPE_Q4_0:
+			return "q4_0";
 		default:
 			return nullptr;
 	}
@@ -50,7 +52,7 @@ const char *type_tag(ggml_type t) {
 
 bool has_kernel(ggml_type a, ggml_type b) {
 	if (b == GGML_TYPE_F32) {
-		return a == GGML_TYPE_F32 || a == GGML_TYPE_F16 || a == GGML_TYPE_BF16;
+		return a == GGML_TYPE_F32 || a == GGML_TYPE_F16 || a == GGML_TYPE_BF16 || a == GGML_TYPE_Q4_0;
 	}
 	return b == GGML_TYPE_F16 && a == GGML_TYPE_F16;
 }
@@ -104,7 +106,7 @@ bool supports_mul_mat(const ggml_tensor *op) {
 			op->ne[3] != b->ne[3]) {
 		return false;
 	}
-	if (!tensor_fits(op) || !tensor_fits(a) || !tensor_fits(b)) {
+	if (!tensor_fits(op) || !(a->type == GGML_TYPE_Q4_0 ? tensor_fits_q4_0(a) : tensor_fits(a)) || !tensor_fits(b)) {
 		return false;
 	}
 	if (b->ne[2] % a->ne[2] != 0 || b->ne[3] % a->ne[3] != 0) {

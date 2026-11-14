@@ -73,6 +73,9 @@ bool grid_1d(Pack &p, uint64_t threads);
 // unallocated tensor has none yet (fill_standard checks it).
 bool tensor_fits(const ggml_tensor *t);
 
+// A Q4_0 tensor whose blocks and strides a kernel can address as element indexes (fill_block).
+bool tensor_fits_q4_0(const ggml_tensor *t);
+
 // Where a tensor's data starts in the buffer that is bound for it, in bytes.
 using OffsetFn = bool (*)(const ggml_tensor *t, void *user, uint64_t *byte_offset);
 

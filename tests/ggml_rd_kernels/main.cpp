@@ -103,6 +103,23 @@ std::vector<float> to_float(const ggml_tensor *t) {
 void fill(ggml_tensor *t, std::mt19937 &rng, float lo, float hi) {
 	std::uniform_real_distribution<float> u(lo, hi);
 	const int64_t n = ggml_nelements(t);
+	if (ggml_is_quantized(t->type)) {
+		// Rows of a block-quantized tensor are quantized from random f32 rows (random bytes would be NaN scales).
+		const ggml_type_traits *tr = ggml_get_type_traits(t->type);
+		std::vector<float> row(size_t(t->ne[0]));
+		for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+			for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+				for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+					for (float &x : row) {
+						x = u(rng);
+					}
+					tr->from_float_ref(row.data(), static_cast<uint8_t *>(t->data) + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3],
+							t->ne[0]);
+				}
+			}
+		}
+		return;
+	}
 	for (int64_t i = 0; i < n; ++i) {
 		const float x = u(rng);
 		uint8_t *p = static_cast<uint8_t *>(t->data);
