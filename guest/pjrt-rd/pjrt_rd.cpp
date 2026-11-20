@@ -688,6 +688,7 @@ PJRT_Error *rd_loaded_execute(PJRT_LoadedExecutable_Execute_Args *a) {
 		const_off[k] = const_total;
 		const_total += (prog.consts[k].bytes.size() + 255) & ~size_t(255);
 	}
+	std::vector<ggml_backend_buffer_t> converted; // the f32 copies of i32 arguments
 	ggml_backend_buffer_t const_buf = nullptr;
 	if (const_total != 0) {
 		const_buf = ggml_backend_alloc_buffer(g_backend, const_total);
@@ -707,6 +708,32 @@ PJRT_Error *rd_loaded_execute(PJRT_LoadedExecutable_Execute_Args *a) {
 			PJRT_Buffer *b = argv[next_arg++];
 			if (b == nullptr || b->deleted) {
 				fail = "Execute: argument " + std::to_string(next_arg - 1) + " is null or deleted";
+			} else if (next_arg - 1 < prog.arg_i32.size() && prog.arg_i32[next_arg - 1] != 0) {
+				// An i32 argument: read it back, convert it to f32 whole numbers on the host and place the copy.
+				const size_t bytes = ggml_nbytes(x);
+				if (b->bytes < bytes) {
+					fail = "Execute: argument " + std::to_string(next_arg - 1) + " holds " + std::to_string(b->bytes) + " bytes, '" + r.name + "' needs " + std::to_string(bytes);
+					continue;
+				}
+				std::vector<int32_t> raw(bytes / 4);
+				ggml_backend_tensor_get(b->tensor, raw.data(), 0, bytes);
+				std::vector<float> whole(raw.size());
+				for (size_t k = 0; k < raw.size() && fail.empty(); ++k) {
+					if (raw[k] > (1 << 24) || raw[k] < -(1 << 24)) {
+						fail = "Execute: i32 argument " + std::to_string(next_arg - 1) + " holds " + std::to_string(raw[k]) + ", outside the 2^24 an f32 holds exactly";
+					}
+					whole[k] = float(raw[k]);
+				}
+				ggml_backend_buffer_t cb = fail.empty() ? ggml_backend_alloc_buffer(g_backend, ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(g_backend), x)) : nullptr;
+				if (fail.empty() && (cb == nullptr || ggml_backend_tensor_alloc(cb, x, ggml_backend_buffer_get_base(cb)) != GGML_STATUS_SUCCESS)) {
+					fail = "Execute: placing the converted i32 argument '" + r.name + "' failed";
+				}
+				if (cb != nullptr) {
+					converted.push_back(cb);
+				}
+				if (fail.empty()) {
+					ggml_backend_tensor_set(x, whole.data(), 0, bytes);
+				}
 			} else if (ggml_nbytes(x) > b->bytes || ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(g_backend), x) > ggml_backend_buffer_get_size(b->buffer)) {
 				fail = "Execute: argument " + std::to_string(next_arg - 1) + " holds " + std::to_string(b->bytes) + " bytes, '"
 						+ r.name + "' needs " + std::to_string(ggml_nbytes(x));
@@ -779,6 +806,9 @@ PJRT_Error *rd_loaded_execute(PJRT_LoadedExecutable_Execute_Args *a) {
 	}
 	if (const_buf != nullptr) {
 		ggml_backend_buffer_free(const_buf);
+	}
+	for (ggml_backend_buffer_t cb : converted) {
+		ggml_backend_buffer_free(cb);
 	}
 	ggml_free(ctx);
 	if (result == nullptr && a->device_complete_events != nullptr) {

@@ -41,6 +41,10 @@ struct Program {
 	std::vector<TensorRec> t;
 	std::vector<Const> consts; // leaves that are not arguments: data the module itself carries
 	std::vector<int> args; // ids of the ggml.arg records, in argument order
+	// For each argument, 1 when the module declares it i32: its record is an f32 tensor of whole numbers (the
+	// StableHLO lowering holds every run-time integer that way) and Execute converts the caller's i32 buffer on
+	// the host, because ggml-rd has no i32 to f32 copy kernel. Empty when no argument is i32.
+	std::vector<uint8_t> arg_i32;
 	std::vector<int> outs; // ids of the results, in result order
 };
 

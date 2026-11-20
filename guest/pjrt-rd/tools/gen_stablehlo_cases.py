@@ -2,15 +2,25 @@
 output XLA's CPU backend gives for them, and a mutated module per case that must not give that output.
 
   pixi run --manifest-path <stablehlo-gen>/pixi.toml python gen_stablehlo_cases.py <out.inc>
+
+The references of sin_stress, cos_stress and rope_neox are XLA CPU calling the C runtime's sinf and cosf, and
+the lowering matches the Windows runtime (UCRT). On another platform their bytes are kept from the <out.inc>
+that is being replaced (KEEP_REFERENCE); it is an error if that file does not have them.
 """
+import platform
+import re
 import sys
 
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from jax.scipy.special import erf as jax_erf
 
 BF16 = ml_dtypes.bfloat16
+
+# Cases whose reference is the Windows C runtime's sinf and cosf (tests/xla_sincos): generated on Windows only.
+KEEP_REFERENCE = ("sin_stress", "cos_stress", "rope_neox")
 
 # Cases whose output is not bit-equal to XLA CPU's, each with what was measured. The probe still holds
 # them to the functional bar and fails if one turns bit-equal, so the list can only shrink.
@@ -197,6 +207,123 @@ def cases():
     qkv = [rand(rng, (1, 8, 2, 16)) for _ in range(3)]
     add("causal_attention", lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True), qkv, ("compare GE", "compare GT"),
         "JAX's causal dot_product_attention: calls, rank-5 values, iota, compare, and, select, dot_general with two free dimensions")
+    # --- tanh, logistic, erf and power -------------------------------------------------------------------
+    # logistic is 1 / (1 + exp(-x)) in XLA and here. tanh and erf are rationals XLA evaluates with fused
+    # multiply-adds (tools/unary_compose_xla.py), which separate kernels cannot reproduce.
+    urng = np.random.default_rng(20261120)
+    ubits = lambda n: urng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32).view(np.float32)
+    usp = np.array([0.0, -0.0, 1e-45, -1e-45, 1e-39, np.inf, -np.inf, np.nan, 4e-4, -4e-4, 3.9e-4, 7.9988117, 7.9053111, -7.9988117, 20.0, -20.0,
+                    19.99, 3.8325069, -3.8325069, 3.83, 88.7, -88.7, 100.0, -100.0, 1.0, -1.0, 0.5, 9.0], np.float32)
+    def stress(*parts):
+        v = np.concatenate([np.asarray(q, np.float32) for q in parts] + [usp]).astype(np.float32)
+        return np.concatenate([v, urng.uniform(-3, 3, 4096 - len(v)).astype(np.float32)])[:4096]
+    add("tanh_f32", lambda a: jnp.tanh(a), [rand(rng, (8, 16), 2.0)], ("stablehlo.tanh", "stablehlo.negate"), "tanh")
+    add("tanh_stress", lambda a: jnp.tanh(a), [stress(ubits(900), urng.uniform(-10, 10, 1500), urng.uniform(-1e-3, 1e-3, 400), urng.uniform(-25, 25, 500))],
+        ("stablehlo.tanh", "stablehlo.negate"), "tanh over every range of XLA's rational: the small-input pass-through, the clamp and the +-1 tail")
+    add("logistic_f32", lambda a: jax.nn.sigmoid(a), [rand(rng, (8, 16), 3.0)], ("stablehlo.logistic", "stablehlo.negate"), "logistic")
+    add("logistic_stress", lambda a: jax.nn.sigmoid(a), [stress(ubits(900), urng.uniform(-30, 30, 1500), urng.uniform(-100, 100, 600), urng.uniform(-1, 1, 300))],
+        ("stablehlo.logistic", "stablehlo.negate"), "logistic over every input class: 1 / (1 + exp(-x)) with XLA's exp")
+    add("silu_f32", lambda a: jax.nn.silu(a), [rand(rng, (8, 16), 3.0)], ("stablehlo.logistic", "stablehlo.negate"), "SiLU: x * logistic(x)")
+    add("erf_f32", lambda a: jax_erf(a), [rand(rng, (8, 16), 1.5)], ("chlo.erf", "stablehlo.negate"), "erf (chlo.erf)")
+    add("erf_stress", lambda a: jax_erf(a), [stress(ubits(900), urng.uniform(-5, 5, 1800), urng.uniform(-1e-3, 1e-3, 300), urng.uniform(3.7, 3.9, 300))],
+        ("chlo.erf", "stablehlo.negate"), "erf over every range of XLA's rational and its +-1 tail")
+    add("gelu_erf", lambda a: jax.nn.gelu(a, approximate=False), [rand(rng, (8, 16), 2.0)], ("chlo.erfc", "chlo.erf"), "exact GELU as JAX writes it: 0.5 * x * erfc(-x / sqrt 2)")
+    add("gelu_tanh", lambda a: jax.nn.gelu(a, approximate=True), [rand(rng, (8, 16), 2.0)], ("stablehlo.tanh", "stablehlo.negate"), "tanh GELU: a cube by multiplies, tanh")
+    pw = np.concatenate([usp, rand(rng, (100,), 3.0)]).astype(np.float32)
+    add("power_square", lambda a: a ** 2.0, [pw], ("dense<2.000000e+00>", "dense<3.000000e+00>"), "power with a constant exponent of 2: x * x, as XLA rewrites it")
+    add("power_cube", lambda a: a ** 3.0, [pw], ("dense<3.000000e+00>", "dense<2.000000e+00>"), "power with a constant exponent of 3: x * x * x")
+    add("power_recip", lambda a: a ** -1.0, [pw], ("dense<-1.000000e+00>", "dense<2.000000e+00>"), "power with a constant exponent of -1: 1 / x")
+
+    # --- i32 at run time and gather ----------------------------------------------------------------------
+    # A run-time i32 is an f32 tensor of whole numbers (exact inside 2^24); an i32 argument is converted on the
+    # host at Execute. A gather takes rows with ggml_get_rows, a 32-bit copy, after clamping the index as XLA does.
+    table = rand(rng, (10, 4))
+    idx8 = np.array([0, 9, -1, -10, 3, 12, -15, 5], np.int32)
+    add("embedding_lookup", lambda t, i: t[i], [table, idx8], ("dense<10>", "dense<9>"),
+        "table[i] with i32 indices at run time: the negative wrap (compare, add, select on i32) and a gather that clamps")
+    add("take_clip", lambda t, i: jnp.take(t, i, axis=0, mode="clip"), [table, idx8], ("slice_sizes = array<i64: 1, 4>", "slice_sizes = array<i64: 1, 3>"),
+        "jnp.take(mode='clip'): the gather alone, on an i32 argument")
+    wide = rand(rng, (3, 10))
+    add("take_axis1_fill", lambda t, i: jnp.take(t, i, axis=1), [wide, idx8], ("compare LE", "compare LT"),
+        "jnp.take on axis 1 in its default mode: a gather, an i1 reduce and a NaN fill for the indices out of range")
+    add("index_pairs", lambda t, i, j: t[i, j], [rand(rng, (5, 6)), np.array([0, 4, -1, 2], np.int32), np.array([5, 0, 3, -2], np.int32)],
+        ("dense<6>", "dense<5>"), "t[i, j]: a gather by an index vector of two, as one linear row index")
+    add("index_constant", lambda t: t[np.array([3, 1, 2, 9, 0])], [table], ("[3, 1, 2, 9, 0]", "[3, 1, 2, 8, 0]"), "table[constant indices]: the index folded on the host")
+    ia = np.array([3, -7, 0, 11, 250, -1000, 4095, 2], np.int32)
+    ib = np.array([5, 2, -3, 11, -17, 999, 1, -2], np.int32)
+    add("i32_arith_runtime", lambda i, j: i * 3 - j + jnp.maximum(i, j) * jnp.minimum(i, 4) - jnp.abs(j), [ia, ib], ("stablehlo.subtract", "stablehlo.add"),
+        "i32 add, subtract, multiply, maximum, minimum and abs at run time, returned as i32")
+    add("i32_convert_runtime", lambda a, i: a.astype(jnp.int32).astype(jnp.float32) * 0.5 + i.astype(jnp.float32) * a + (i > 2).astype(jnp.int32).astype(jnp.float32),
+        [(rand(rng, (8,), 6.0)), ia], ("compare GT", "compare LT"), "f32 to i32 (toward zero), i32 to f32 and i1 to i32 at run time")
+    add("where_i32_runtime", lambda i, j: jnp.where(i > j, i, -j), [ia, ib], ("compare GT", "compare LT"), "select of i32 values by an i32 compare at run time")
+
+    # --- convolution -------------------------------------------------------------------------------------
+    # XLA CPU sums a convolution in its own order, like a dot; integer-valued operands make every partial sum exact.
+    nhwc = ("NHWC", "HWIO", "NHWC")
+    conv = lambda strides, padding, **kw: (lambda x, w: jax.lax.conv_general_dilated(x, w, strides, padding, dimension_numbers=nhwc, **kw))
+    xi, wi = ints(rng, (1, 8, 8, 3)), ints(rng, (3, 3, 3, 5), -2, 3)
+    add("conv_exact", conv((2, 2), ((1, 1), (1, 1))), [xi, wi], ("stride = [2, 2]", "stride = [2, 1]"), "3x3 convolution, stride 2, padding 1, integer-valued: every partial sum is exact")
+    add("conv_random", conv((2, 2), ((1, 1), (1, 1))), [rand(rng, (1, 8, 8, 3)), rand(rng, (3, 3, 3, 5), 0.3)], ("stride = [2, 2]", "stride = [2, 1]"), "3x3 convolution, stride 2, padding 1, random")
+    add("conv_asym_pad_exact", conv((1, 2), ((0, 2), (1, 0))), [xi, wi], ("pad = [[0, 2], [1, 0]]", "pad = [[2, 0], [1, 0]]"), "convolution with another padding on each edge and another stride on each axis")
+    add("conv_dilated_exact", conv((1, 1), ((2, 2), (2, 2)), rhs_dilation=(2, 2)), [xi, wi], ("rhs_dilate = [2, 2]", "rhs_dilate = [2, 1]"), "convolution with a kernel dilation of 2")
+    add("conv_groups_exact", conv((1, 1), ((1, 1), (1, 1)), feature_group_count=2), [ints(rng, (1, 6, 6, 4)), ints(rng, (3, 3, 2, 6), -2, 3)],
+        ("feature_group_count = 2", "feature_group_count = 1"), "convolution with two feature groups")
+    add("conv_depthwise_exact", conv((1, 1), ((1, 1), (1, 1)), feature_group_count=4), [ints(rng, (1, 6, 6, 4)), ints(rng, (3, 3, 1, 4), -2, 3)],
+        ("stride = [1, 1]", "stride = [2, 1]"), "depthwise convolution: one feature group for each channel")
+    add("conv_nchw_exact", lambda x, w: jax.lax.conv_general_dilated(x, w, (1, 1), ((1, 1), (1, 1)), dimension_numbers=("NCHW", "OIHW", "NCHW")),
+        [ints(rng, (2, 3, 6, 6)), ints(rng, (5, 3, 3, 3), -2, 3)], ("pad = [[1, 1], [1, 1]]", "pad = [[1, 1], [0, 2]]"), "convolution in the NCHW and OIHW layout, batch of two")
+    add("conv_1d_exact", lambda x, w: jax.lax.conv_general_dilated(x, w, (2,), ((1, 1),), dimension_numbers=("NWC", "WIO", "NWC")),
+        [ints(rng, (1, 12, 3)), ints(rng, (3, 3, 4), -2, 3)], ("stride = [2]", "stride = [1]"), "convolution over one spatial dimension")
+    tconv = lambda x, w: jax.lax.conv_transpose(x, w, (2, 2), "SAME", dimension_numbers=nhwc)
+    add("conv_transpose_exact", tconv, [ints(rng, (1, 4, 4, 3)), ints(rng, (2, 2, 3, 5), -2, 3)], ("lhs_dilate = [2, 2]", "lhs_dilate = [2, 1]"),
+        "jax.lax.conv_transpose, stride 2: a convolution of the input dilated by 2")
+    add("conv_transpose_random", lambda x, w: jax.lax.conv_transpose(x, w, (2, 2), "SAME", dimension_numbers=nhwc), [rand(rng, (1, 4, 4, 3)), rand(rng, (3, 3, 3, 5), 0.3)],
+        ("lhs_dilate = [2, 2]", "lhs_dilate = [2, 1]"), "jax.lax.conv_transpose with a 3x3 kernel, random")
+    add("patch_embed", lambda x, w, b: jax.lax.conv_general_dilated(x, w, (4, 4), "VALID", dimension_numbers=nhwc).reshape(1, 16, 8) + b[None, None, :],
+        [rand(rng, (1, 16, 16, 3)), rand(rng, (4, 4, 3, 8), 0.2), rand(rng, (8,), 0.1)], ("stride = [4, 4]", "stride = [4, 3]"), "a ViT patch embedding: a 4x4 convolution with stride 4, flattened, plus a bias")
+
+    # --- windows, clamp, pad -----------------------------------------------------------------------------
+    pool = lambda init, f, win, strides, padding: (lambda x: jax.lax.reduce_window(x, init, f, win, strides, padding))
+    px = rand(rng, (1, 8, 8, 3))
+    add("maxpool_2x2", pool(-jnp.inf, jax.lax.max, (1, 2, 2, 1), (1, 2, 2, 1), "VALID"), [px], ("window_strides = array<i64: 1, 2, 2, 1>", "window_strides = array<i64: 1, 2, 1, 1>"), "2x2 max pooling, stride 2")
+    add("maxpool_3x3_same", pool(-jnp.inf, jax.lax.max, (1, 3, 3, 1), (1, 2, 2, 1), "SAME"), [px], ("window_dimensions = array<i64: 1, 3, 3, 1>", "window_dimensions = array<i64: 1, 3, 2, 1>"),
+        "3x3 max pooling, stride 2, padded with -inf")
+    add("minpool_2x2", pool(jnp.inf, jax.lax.min, (1, 2, 2, 1), (1, 1, 1, 1), "VALID"), [px], ("stablehlo.minimum", "stablehlo.maximum"), "2x2 min pooling, stride 1")
+    add("sumpool_exact", pool(0.0, jax.lax.add, (1, 3, 3, 1), (1, 2, 2, 1), "SAME"), [ints(rng, (1, 8, 8, 3))], ("window_dimensions = array<i64: 1, 3, 3, 1>", "window_dimensions = array<i64: 1, 3, 2, 1>"),
+        "3x3 sum pooling, stride 2, zero padded, integer-valued")
+    add("avgpool_2x2", lambda x: jax.lax.reduce_window(x, 0.0, jax.lax.add, (1, 2, 2, 1), (1, 2, 2, 1), "VALID") / 4.0, [px], ("stablehlo.divide", "stablehlo.multiply"),
+        "2x2 average pooling: a window sum of four, written out in the window's order, then a divide")
+    add("avgpool_3x3", lambda x: jax.lax.reduce_window(x, 0.0, jax.lax.add, (1, 3, 3, 1), (1, 1, 1, 1), "VALID") / 9.0, [px], ("stablehlo.divide", "stablehlo.multiply"),
+        "3x3 average pooling, stride 1: a window sum of nine")
+    spv2 = np.array([0.0, -0.0, 1.0, -1.0, np.inf, -np.inf, np.nan, 1e-45, -1e-45, 1e-39, 1.17549435e-38, 2.0, -2.0, 3.4028235e38, 0.5, -0.5], np.float32)
+    add("clamp_special", lambda a: jax.lax.clamp(-1.0, a, 1.0), [np.concatenate([spv2, rand(rng, (112,), 2.0)]).astype(np.float32)], ("stablehlo.clamp %0, %arg0, %1", "stablehlo.clamp %1, %arg0, %0"),
+        "stablehlo.clamp against scalar bounds, special values included")
+    add("clamp_tensor_bounds", lambda lo, a, hi: jax.lax.clamp(lo, a, hi), [rand(rng, (8, 16)) - 1.0, rand(rng, (8, 16), 2.0), rand(rng, (8, 16)) + 1.0],
+        ("stablehlo.clamp %arg0, %arg1, %arg2", "stablehlo.clamp %arg2, %arg1, %arg0"), "stablehlo.clamp against tensor bounds")
+    add("pad_value", lambda a: jnp.pad(a, ((1, 2), (0, 3)), constant_values=1.5), [rand(rng, (6, 8))], ("low = [1, 0], high = [2, 3]", "low = [2, 0], high = [1, 3]"), "pad with a constant that is not zero")
+    add("pad_interior", lambda a: jax.lax.pad(a, np.float32(0), ((1, 2, 1), (0, 0, 2))), [rand(rng, (6, 8))], ("interior = [1, 2]", "interior = [2, 1]"), "pad with interior padding: zeros between the elements")
+    add("reduce_min_last", lambda a: a.min(axis=-1), [rand(rng, (8, 8))], ("stablehlo.minimum", "stablehlo.maximum"), "reduce minimum")
+    add("reduce_any_all", lambda a: (jnp.any(a > 1.0, axis=-1) | jnp.all(a > -1.5, axis=0)[:8]).astype(jnp.float32), [rand(rng, (8, 16))], ("stablehlo.or across", "stablehlo.and across"),
+        "reduce or and reduce and of run-time predicates")
+
+    # --- slices and updates by index ---------------------------------------------------------------------
+    add("dynamic_slice_runtime", lambda a, i: jax.lax.dynamic_slice(a, (i,), (3,)), [rand(rng, (8,)), np.array(4, np.int32)], ("sizes = [3]", "sizes = [2]"),
+        "dynamic_slice with a start computed at run time: a gather of start .. start + 2")
+    add("dynamic_slice_clamped", lambda a, i, j: jax.lax.dynamic_slice(a, (i, j), (2, 3)), [rand(rng, (5, 6)), np.array(4, np.int32), np.array(-2, np.int32)], ("dense<6>", "dense<5>"),
+        "dynamic_slice of two dimensions whose starts are clamped so that the slice fits")
+    add("update_slice_set", lambda a, b: a.at[2:5].set(b), [rand(rng, (8,)), rand(rng, (3,))], ("dense<2>", "dense<3>"), "x.at[2:5].set(y): a scatter that writes one window")
+    add("update_block_set", lambda a, b: a.at[1:3, 2:5].set(b), [rand(rng, (4, 6)), rand(rng, (2, 3))], ("dense<[1, 2]>", "dense<[2, 2]>"), "x.at[1:3, 2:5].set(y): a window of two dimensions")
+    add("dynamic_update_slice", lambda a, b: jax.lax.dynamic_update_slice(a, b, (np.int32(1), np.int32(2))), [rand(rng, (4, 6)), rand(rng, (2, 3))], ("dense<1>", "dense<0>"),
+        "dynamic_update_slice with a start known at compile time")
+
+    # --- resize as jax.image.resize writes it ------------------------------------------------------------
+    rx = rand(rng, (1, 4, 4, 3))
+    add("resize_nearest_up", lambda a: jax.image.resize(a, (1, 8, 8, 3), "nearest"), [rx], ("dense<4.000000e+00>", "dense<3.000000e+00>"),
+        "jax.image.resize nearest, 2x: an index from floats (floor, convert to i32) and two gathers")
+    add("resize_bilinear_up", lambda a: jax.image.resize(a, (1, 8, 8, 3), "bilinear"), [rx], ("dense<3.500000e+00>", "dense<2.500000e+00>"),
+        "jax.image.resize bilinear, 2x: weight matrices computed in the module and two dot_generals")
+    add("resize_bilinear_exact", lambda a: jax.image.resize(a, (1, 8, 8, 3), "bilinear"), [ints(rng, (1, 4, 4, 3)) * 16.0], ("dense<3.500000e+00>", "dense<2.500000e+00>"),
+        "jax.image.resize bilinear, 2x, on multiples of 16: every weight is a quarter, so every partial sum is exact")
     return out
 
 
@@ -222,7 +349,24 @@ def mutated(text, rule):
 
 
 def dtype_tag(a):
-    return {np.dtype(np.float32): "f32", np.dtype(BF16): "bf16"}[a.dtype]
+    return {np.dtype(np.float32): "f32", np.dtype(BF16): "bf16", np.dtype(np.int32): "i32"}[a.dtype]
+
+
+def kept_references(path):
+    """The reference bytes of the KEEP_REFERENCE cases, from the file that is being replaced."""
+    if platform.system() == "Windows":
+        return {}
+    try:
+        text = open(path).read()
+    except OSError:
+        raise SystemExit("%s must exist: it holds the references of %s, which only Windows can generate" % (path, ", ".join(KEEP_REFERENCE)))
+    kept = {}
+    for name in KEEP_REFERENCE:
+        m = re.search(r"static const unsigned char %s_out\[\] = \{([^}]*)\};" % name, text)
+        if m is None:
+            raise SystemExit("%s has no reference for %s to keep" % (path, name))
+        kept[name] = m.group(1)
+    return kept
 
 
 def c_bytes(a):
@@ -232,18 +376,28 @@ def c_bytes(a):
 
 def main():
     path = sys.argv[1]
-    lines = ["// Generated by gen_stablehlo_cases.py with jax %s. Do not edit." % jax.__version__, ""]
+    kept = kept_references(path)
+    lines = ["// Generated by gen_stablehlo_cases.py with jax %s. Do not edit." % jax.__version__]
+    if kept:
+        lines.append("// The references of %s are kept from the Windows run: they are the C runtime's sinf and cosf." % ", ".join(KEEP_REFERENCE))
+    lines.append("")
     names = []
+    seen = set()
     for idx, (name, fn, args, rule, note) in enumerate(cases()):
+        if name in seen:
+            raise SystemExit("case %s is defined twice" % name)
+        seen.add(name)
         text = lower(fn, args)
         res = np.asarray(jax.jit(fn)(*[jnp.asarray(a) for a in args]))
         bad = mutated(text, rule)
         if "stablehlo.custom_call" in text:
             raise SystemExit("%s lowered to something outside the slice:\n%s" % (name, text))
+        if res.size == 0 or not np.any(np.asarray(res, np.float64) != 0):
+            raise SystemExit("%s has a reference of zeros, which proves nothing" % name)
         lines.append("// %s: %s" % (name, note))
         for k, a in enumerate(args):
             lines.append("static const unsigned char %s_a%d[] = {%s};" % (name, k, c_bytes(a)))
-        lines.append("static const unsigned char %s_out[] = {%s};" % (name, c_bytes(res)))
+        lines.append("static const unsigned char %s_out[] = {%s};" % (name, kept.get(name) or c_bytes(res)))
         lines.append('static const char %s_hlo[] = R"HLO(%s)HLO";' % (name, text))
         lines.append('static const char %s_bad[] = R"HLO(%s)HLO";' % (name, bad))
         argdefs = ",".join("{StablehloDtype::%s,%d,%s_a%d,sizeof(%s_a%d)}" % (dtype_tag(a).upper(), a.size, name, k, name, k) for k, a in enumerate(args))
@@ -251,6 +405,8 @@ def main():
         names.append((name, dtype_tag(res), res.size, len(args), note))
         lines.append("")
     lines.append("static const StablehloCase kStablehloCases[] = {")
+    for unknown in sorted(set(XFAIL) - seen):
+        raise SystemExit("XFAIL names %s, which is not a case" % unknown)
     for name, tag, count, nargs, note in names:
         xf = XFAIL.get(name)
         lines.append('\t{"%s", %s_hlo, %s_bad, %s_args, %d, %s_out, sizeof(%s_out), StablehloDtype::%s, "%s", %s},' % (

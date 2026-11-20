@@ -67,6 +67,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rdc {
 class Device;
@@ -84,5 +85,8 @@ bool start(const std::string &name, const std::string &arg, std::string &err);
 // entry; nullptr past its end).
 std::string graph_dump_list();
 const uint8_t *graph_dump_chunk(size_t index, size_t offset, size_t &bytes);
+
+// A result of the last "pjrt module" run (probe_pjrt.cpp) by name (out0.bin, ...), or null.
+const std::vector<uint8_t> *pjrt_result(const std::string &name);
 
 } // namespace probes

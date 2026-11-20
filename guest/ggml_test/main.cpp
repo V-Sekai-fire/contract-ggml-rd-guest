@@ -295,6 +295,24 @@ static Variant ggml_rd_close() {
 	return Variant(String("CLOSED permanent_slots=" + std::to_string(g_dev.permanent_slots())));
 }
 
+// The size of a result of the last "pjrt module" run (out0.bin, ...), or -1 when there is none.
+static Variant pjrt_size(String name) {
+	const std::vector<uint8_t> *b = probes::pjrt_result(name.utf8());
+	return Variant(int64_t(b == nullptr ? -1 : int64_t(b->size())));
+}
+
+// Bytes [offset, offset + bytes) of that result, at most 8 MiB a call (a PackedByteArray made from guest memory
+// faults above 16 MiB, finding 3).
+static Variant pjrt_get(String name, int64_t offset, int64_t bytes) {
+	const std::vector<uint8_t> *b = probes::pjrt_result(name.utf8());
+	const size_t off = size_t(std::max<int64_t>(offset, 0));
+	if (b == nullptr || off >= b->size()) {
+		return Variant(PackedArray<uint8_t>(std::vector<uint8_t>()));
+	}
+	const size_t n = std::min<size_t>(std::min<size_t>(size_t(std::max<int64_t>(bytes, 0)), size_t(8) << 20), b->size() - off);
+	return Variant(PackedArray<uint8_t>(b->data() + off, n));
+}
+
 int main() {
 	ADD_API_FUNCTION(ggml_attach, "String", "Object rd, int total_mb", "Attach the host's RenderingDevice (null: none)");
 	ADD_API_FUNCTION(ggml_ops_start, "String", "String args, String env", "Start test-backend-ops on the pump");
@@ -305,5 +323,7 @@ int main() {
 	ADD_API_FUNCTION(ggml_dump_chunk, "PackedByteArray", "int index, int offset, int bytes", "Bytes of one dumped output (<= 8 MiB)");
 	ADD_API_FUNCTION(ggml_rd_stats, "String", "", "ggml-rd and rd_compute counters");
 	ADD_API_FUNCTION(ggml_rd_close, "String", "", "Release ggml-rd's RD objects");
+	ADD_API_FUNCTION(pjrt_size, "int", "String name", "Size of a result of the last pjrt module run, -1 if there is none");
+	ADD_API_FUNCTION(pjrt_get, "PackedByteArray", "String name, int offset, int bytes", "Bytes of a result of the last pjrt module run (<= 8 MiB)");
 	halt();
 }

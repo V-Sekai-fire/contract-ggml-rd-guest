@@ -20,8 +20,9 @@ namespace pjrt_rd {
 
 namespace {
 
-// Element types. i32 and i1 values exist only at compile time (iota, constants, compares of them, masks):
-// they are folded on the host and never become a ggml tensor. GGML_TYPE_I8 stands for i1.
+// Element types. An i32 or i1 value known at compile time (iota, constants, compares of them, masks) is folded
+// on the host and has no tensor. One computed at run time is an f32 tensor of whole numbers (0 and 1 for an i1)
+// that carries the label i32 or i1: exact while every value stays inside 2^24. GGML_TYPE_I8 stands for i1.
 const ggml_type kPred = GGML_TYPE_I8;
 
 bool is_float(ggml_type t) {
@@ -29,7 +30,7 @@ bool is_float(ggml_type t) {
 }
 
 struct Val {
-	ggml_tensor *t = nullptr; // null for an i32 or i1 value, which is always known
+	ggml_tensor *t = nullptr; // null for an i32 or i1 value known at compile time; f32 for one computed at run time
 	std::vector<int64_t> shape; // row-major, as StableHLO writes it
 	ggml_type type = GGML_TYPE_F32;
 	bool neg_inf = false; // a constant -inf, or a reshape or broadcast of one
@@ -53,6 +54,7 @@ struct Lowering {
 	std::map<std::string, Val> vals;
 	std::vector<ggml_tensor *> params;
 	std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> consts;
+	std::map<std::pair<std::vector<int64_t>, uint32_t>, ggml_tensor *> fills; // constants of one value, by ne and bits
 	std::string err;
 
 	bool fail(const std::string &e) {
@@ -321,8 +323,10 @@ Val as_type(Lowering &L, const Val &v, ggml_type type) {
 	if (v.type == type) {
 		return v;
 	}
-	if ((v.type == kPred && type == GGML_TYPE_F32) || (v.type == GGML_TYPE_F32 && type == kPred)) {
-		// An i1 value computed at run time is an f32 tensor of 0 and 1: only the label changes.
+	const bool from_whole = v.type == kPred || v.type == GGML_TYPE_I32;
+	const bool to_whole = type == kPred || type == GGML_TYPE_I32;
+	if ((from_whole && type == GGML_TYPE_F32) || (v.type == GGML_TYPE_F32 && to_whole)) {
+		// An i1 or i32 value computed at run time is an f32 tensor of whole numbers: only the label changes.
 		Val o = v;
 		o.type = type;
 		return o;
@@ -463,13 +467,51 @@ Val filled(Lowering &L, const std::vector<int64_t> &shape, float v) {
 
 // An f32 constant tensor with like's ne, every element v.
 ggml_tensor *filled_like(Lowering &L, const ggml_tensor *like, float v) {
+	uint32_t bits = 0;
+	std::memcpy(&bits, &v, 4);
+	const std::pair<std::vector<int64_t>, uint32_t> key(std::vector<int64_t>(like->ne, like->ne + GGML_MAX_DIMS), bits);
+	const std::map<std::pair<std::vector<int64_t>, uint32_t>, ggml_tensor *>::const_iterator have = L.fills.find(key);
+	if (have != L.fills.end()) {
+		return have->second;
+	}
 	ggml_tensor *t = ggml_new_tensor_4d(L.ctx, GGML_TYPE_F32, like->ne[0], like->ne[1], like->ne[2], like->ne[3]);
+	L.fills[key] = t;
 	std::vector<uint8_t> bytes(size_t(ggml_nelements(t)) * 4);
 	for (size_t i = 0; i < bytes.size() / 4; ++i) {
 		std::memcpy(bytes.data() + i * 4, &v, 4);
 	}
 	L.consts[t] = std::move(bytes);
 	return t;
+}
+
+// XLA CPU's maximum or minimum against one constant (a tensor of one element, repeated by the kernel).
+ggml_tensor *xla_against(Lowering &L, ggml_rd_xla_binary_kind kind, ggml_tensor *a, float c) {
+	const Val k = filled(L, {}, c);
+	return ggml_rd_xla_binary_op(L.ctx, a->view_src != nullptr || !ggml_is_contiguous(a) ? ggml_cont(L.ctx, a) : a, k.t, kind);
+}
+
+// c[0] * z^(n-1) + ... + c[n-1], as multiplies and adds that are not fused.
+ggml_tensor *horner(Lowering &L, ggml_tensor *z, const float *c, int n) {
+	ggml_tensor *acc = ggml_scale_bias(L.ctx, z, c[0], c[1]);
+	for (int i = 2; i < n; ++i) {
+		acc = ggml_scale_bias(L.ctx, ggml_mul(L.ctx, z, acc), 1.0f, c[i]);
+	}
+	return acc;
+}
+
+// erf as XLA CPU computes it for f32 (xla/codegen/intrinsic/erf.cc at d867969800d4): the rational
+// x * P(x^2) / Q(x^2) of Eigen, and +-1 from |x| = 3.8325069 on. XLA evaluates P and Q with fused multiply-adds;
+// here each multiply and add is its own kernel, so the result is within a few ulp of XLA's and not bit-equal.
+ggml_tensor *erf_of(Lowering &L, ggml_tensor *x) {
+	static const float kAlpha[] = { 0.00022905065861350646f, 0.0034082910107109506f, 0.050955695062380861f, 0.18520832239976145f, 1.128379143519084f };
+	static const float kBeta[] = { -1.1791602954361697e-7f, 0.000023547966471313185f, 0.0010179625278914885f, 0.014070470171167667f, 0.11098505178285362f,
+		0.49746925110067538f, 1.0f };
+	const float lim = 3.832506856900711f;
+	ggml_tensor *xc = xla_against(L, GGML_RD_XLA_MIN, xla_against(L, GGML_RD_XLA_MAX, x, -lim), lim);
+	ggml_tensor *x2 = ggml_mul(L.ctx, xc, xc);
+	ggml_tensor *p = ggml_mul(L.ctx, xc, horner(L, x2, kAlpha, 5));
+	ggml_tensor *q = horner(L, x2, kBeta, 7);
+	return xla_against(L, GGML_RD_XLA_MIN, xla_against(L, GGML_RD_XLA_MAX, ggml_div(L.ctx, p, q), -1.0f), 1.0f);
 }
 
 bool op_unary(Lowering &L, const std::string &op, const Val &a, Val &out) {
@@ -512,6 +554,21 @@ bool op_unary(Lowering &L, const std::string &op, const Val &a, Val &out) {
 	} else if (op == "rsqrt") {
 		// XLA CPU's rsqrt is the CPU's estimate instruction and one Newton step; this is that on a Zen 2 (rsqrt_zen2.h).
 		o.t = ggml_rd_rsqrt_zen2_op(L.ctx, contiguous(L, f.t));
+	} else if (op == "logistic") {
+		// XLA expands logistic to 1 / (1 + exp(-x)) before it emits code, and each of those is bit-equal here
+		// (tools/unary_compose_xla.py: 0 of 920,015 inputs differ).
+		ggml_tensor *e = ggml_exp(L.ctx, ggml_neg(L.ctx, f.t));
+		ggml_tensor *d = ggml_scale_bias(L.ctx, e, 1.0f, 1.0f);
+		o.t = ggml_div(L.ctx, filled_like(L, d, 1.0f), d);
+	} else if (op == "tanh") {
+		// ggml-rd's TANH kernel. XLA CPU's tanh is a clamped rational evaluated with fused multiply-adds
+		// (xla/codegen/intrinsic/tanh.cc), so this is close to it and not bit-equal.
+		o.t = ggml_tanh(L.ctx, f.t);
+	} else if (op == "erf") {
+		o.t = erf_of(L, contiguous(L, f.t));
+	} else if (op == "erfc") {
+		// 1 - erf(x): exact to an ulp of 1, so the tail (erfc below about 1e-7) has no relative precision.
+		o.t = ggml_scale_bias(L.ctx, erf_of(L, contiguous(L, f.t)), -1.0f, 1.0f);
 	} else {
 		return L.unsupported("stablehlo." + op);
 	}
@@ -540,6 +597,25 @@ bool op_binary(Lowering &L, const std::string &op, const Val &a, const Val &b, V
 		o.t = ggml_sub(L.ctx, fa.t, fb.t);
 	} else if (op == "multiply") {
 		o.t = ggml_mul(L.ctx, fa.t, fb.t);
+	} else if (op == "power") {
+		// XLA CPU's power is the C library's powf, except for the exponents its simplifier rewrites. Those measured
+		// equal to a composition here (tools/unary_compose_xla.py) are lowered; the rest is refused.
+		bool same = b.known && !b.hv.empty();
+		for (size_t i = 1; same && i < b.hv.size(); ++i) {
+			same = b.hv[i] == b.hv[0];
+		}
+		const double e = same ? b.hv[0] : 0.0;
+		if (same && e == 2.0) {
+			o.t = ggml_mul(L.ctx, fa.t, fa.t);
+		} else if (same && e == 3.0) {
+			o.t = ggml_mul(L.ctx, ggml_mul(L.ctx, fa.t, fa.t), fa.t);
+		} else if (same && e == 1.0) {
+			o.t = fa.t;
+		} else if (same && e == -1.0) {
+			o.t = ggml_div(L.ctx, filled_like(L, fa.t, 1.0f), fa.t);
+		} else {
+			return L.unsupported("stablehlo.power with an exponent other than a constant 2, 3, 1 or -1 (the general case is the C library's powf)");
+		}
 	} else if (op == "divide") {
 		if (fb.pre != nullptr && fb.type == GGML_TYPE_F32 && fb.pre->type == GGML_TYPE_F32) {
 			// XLA's algebraic simplifier rewrites a / broadcast(b) as a * broadcast(1 / b), which rounds twice.
@@ -567,7 +643,7 @@ float element_f32(const Val &c, const std::vector<uint8_t> &bytes) {
 	return ggml_bf16_to_fp32(b);
 }
 
-// stablehlo.reduce of add or maximum over some dimensions, with the operation's identity as init.
+// stablehlo.reduce of add, maximum, minimum, and, or over some dimensions, with the operation's identity as init.
 bool op_reduce(Lowering &L, const std::string &attrs, const Val &x, const Val &init, const Ty &to, Val &out) {
 	const size_t ap = attrs.find("applies stablehlo.");
 	if (ap == std::string::npos) {
@@ -576,8 +652,13 @@ bool op_reduce(Lowering &L, const std::string &attrs, const Val &x, const Val &i
 	const size_t ks = ap + 18;
 	const size_t ke = attrs.find(' ', ks);
 	const std::string kind = attrs.substr(ks, ke == std::string::npos ? std::string::npos : ke - ks);
-	if (kind != "add" && kind != "maximum") {
+	const bool pred = x.type == kPred;
+	const bool whole = pred || x.type == GGML_TYPE_I32;
+	if (kind != "add" && kind != "maximum" && kind != "minimum" && kind != "and" && kind != "or") {
 		return L.unsupported("stablehlo.reduce applying stablehlo." + kind);
+	}
+	if (((kind == "and" || kind == "or") && !pred) || (kind == "add" && pred)) {
+		return L.unsupported("stablehlo.reduce applying stablehlo." + kind + " to this element type");
 	}
 	std::vector<int64_t> dims;
 	if (!int_list(attrs, "dimensions", 0, dims, nullptr)) {
@@ -591,12 +672,22 @@ bool op_reduce(Lowering &L, const std::string &attrs, const Val &x, const Val &i
 		}
 		reduced[size_t(d)] = true;
 	}
-	std::unordered_map<const ggml_tensor *, std::vector<uint8_t> >::const_iterator ci = L.consts.find(init.t);
-	if (ci == L.consts.end() || !init.shape.empty()) {
+	if (!init.known || !init.shape.empty() || init.hv.size() != 1) {
 		return L.unsupported("stablehlo.reduce with an init that is not a scalar constant");
 	}
-	const float iv = element_f32(init, ci->second);
-	const bool identity = kind == "add" ? (iv == 0.0f && !std::signbit(iv)) : (std::isinf(iv) && iv < 0.0f);
+	const double iv = init.hv[0];
+	const bool is_max = kind == "maximum" || kind == "or";
+	const bool is_min = kind == "minimum" || kind == "and";
+	bool identity = false;
+	if (kind == "add") {
+		identity = iv == 0.0 && !std::signbit(iv);
+	} else if (pred) {
+		identity = iv == (is_max ? 0.0 : 1.0);
+	} else if (x.type == GGML_TYPE_I32) {
+		identity = iv == (is_max ? -2147483648.0 : 2147483647.0);
+	} else {
+		identity = std::isinf(iv) && (is_max ? iv < 0.0 : iv > 0.0);
+	}
 	if (!identity) {
 		return L.unsupported("stablehlo.reduce whose init is not the identity of " + kind);
 	}
@@ -618,7 +709,19 @@ bool op_reduce(Lowering &L, const std::string &attrs, const Val &x, const Val &i
 		return L.fail("stablehlo.reduce: the result shape does not match the kept dimensions");
 	}
 	if (x.t == nullptr) {
-		return L.unsupported("stablehlo.reduce of i32 or i1 values");
+		// An i32 or i1 value known at compile time: folded on the host.
+		const std::vector<double> t = h_transpose(x.hv, x.shape, perm);
+		std::vector<double> hv(size_t(count_of(kept)));
+		for (size_t i = 0; i < hv.size(); ++i) {
+			double acc = iv;
+			for (int64_t k = 0; k < n; ++k) {
+				const double v = t[i * size_t(n) + size_t(k)];
+				acc = kind == "add" ? h_wrap32(int64_t(acc) + int64_t(v)) : is_max ? std::max(acc, v) : std::min(acc, v);
+			}
+			hv[i] = acc;
+		}
+		out = known_val(L, x.type, kept, std::move(hv));
+		return true;
 	}
 	if (n == 1 && kept.size() + 1 > GGML_MAX_DIMS) {
 		return L.unsupported("stablehlo.reduce over dimensions of size one above rank 4");
@@ -632,8 +735,15 @@ bool op_reduce(Lowering &L, const std::string &attrs, const Val &x, const Val &i
 	o.type = GGML_TYPE_F32;
 	if (kind == "add") {
 		o.t = ggml_sum_rows(L.ctx, v.t);
-	} else {
+	} else if (is_max) {
 		o.t = ggml_pool_1d(L.ctx, v.t, GGML_OP_POOL_MAX, int(n), int(n), 0);
+	} else {
+		// The minimum is the negated maximum of the negated values; a negation is exact.
+		o.t = ggml_neg(L.ctx, ggml_pool_1d(L.ctx, ggml_neg(L.ctx, v.t), GGML_OP_POOL_MAX, int(n), int(n), 0));
+		if (whole) {
+			// -0 for a whole number is 0; adding 0 writes it as +0.
+			o.t = ggml_scale_bias(L.ctx, o.t, 1.0f, 0.0f);
+		}
 	}
 	std::vector<int64_t> rows = kept;
 	rows.push_back(1);
@@ -842,7 +952,118 @@ bool op_concatenate(Lowering &L, const std::string &attrs, const std::vector<Val
 	return true;
 }
 
-// stablehlo.pad with a zero padding value, non-negative edges and no interior padding.
+bool op_concatenate(Lowering &L, const std::string &attrs, const std::vector<Val> &in, Val &out);
+
+// The elements [start, start + count) of dimension dim.
+bool slice_dim(Lowering &L, const Val &x, size_t dim, int64_t start, int64_t count, Val &out) {
+	std::string a = "[";
+	for (size_t i = 0; i < x.shape.size(); ++i) {
+		a += (i == 0 ? "" : ", ") + (i == dim ? std::to_string(start) + ":" + std::to_string(start + count) : "0:" + std::to_string(x.shape[i]));
+	}
+	return op_slice(L, a + "]", x, Ty(), out);
+}
+
+bool concat_dim(Lowering &L, const std::vector<Val> &parts, size_t dim, Val &out) {
+	if (parts.size() == 1) {
+		out = parts[0];
+		return true;
+	}
+	return op_concatenate(L, "dim = " + std::to_string(dim), parts, out);
+}
+
+// `gap` zeros after every element of dimension dim but the last: n elements become n + (n - 1) * gap.
+bool dilate_dim(Lowering &L, const Val &x, size_t dim, int64_t gap, Val &out) {
+	const size_t r = x.shape.size();
+	const int64_t n = x.shape[dim];
+	if (gap == 0 || n == 1) {
+		out = x;
+		return true;
+	}
+	std::vector<int64_t> perm, back(r), rest;
+	for (size_t i = 0; i < r; ++i) {
+		if (i != dim) {
+			perm.push_back(int64_t(i));
+			rest.push_back(x.shape[i]);
+		}
+	}
+	perm.push_back(int64_t(dim));
+	for (size_t i = 0; i < r; ++i) {
+		back[size_t(perm[i])] = int64_t(i);
+	}
+	const int64_t others = count_of(rest);
+	Val v = reshaped(L, transposed(L, as_type(L, x, GGML_TYPE_F32), perm), { others, n, 1 });
+	Val padded = v;
+	padded.t = ggml_pad_ext(L.ctx, contiguous(L, v.t), 0, int(gap), 0, 0, 0, 0, 0, 0);
+	padded.shape = { others, n, 1 + gap };
+	Val flat = reshaped(L, padded, { others, n * (1 + gap) });
+	Val cut;
+	if (!slice_dim(L, flat, 1, 0, n + (n - 1) * gap, cut)) {
+		return false;
+	}
+	std::vector<int64_t> shape = rest;
+	shape.push_back(n + (n - 1) * gap);
+	out = as_type(L, transposed(L, reshaped(L, cut, shape), back), x.type);
+	out.known = false;
+	out.hv.clear();
+	return true;
+}
+
+// Edge padding of a float or run-time whole-number value with one value. Zero is ggml's PAD; another value is
+// a concatenation with constants, so the padded elements keep their bits.
+bool pad_edges(Lowering &L, const Val &x, const std::vector<int64_t> &low, const std::vector<int64_t> &high, float value, Val &out) {
+	const size_t r = x.shape.size();
+	bool any = false;
+	for (size_t i = 0; i < r; ++i) {
+		any = any || low[i] != 0 || high[i] != 0;
+	}
+	if (!any) {
+		out = x;
+		return true;
+	}
+	Val f = as_type(L, x, GGML_TYPE_F32);
+	if (value == 0.0f && !std::signbit(value) && r <= GGML_MAX_DIMS) {
+		int lp[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
+		int rp[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
+		for (size_t i = 0; i < r; ++i) {
+			lp[r - 1 - i] = int(low[i]);
+			rp[r - 1 - i] = int(high[i]);
+		}
+		Val o = f;
+		o.t = ggml_pad_ext(L.ctx, contiguous(L, f.t), lp[0], rp[0], lp[1], rp[1], lp[2], rp[2], lp[3], rp[3]);
+		for (size_t i = 0; i < r; ++i) {
+			o.shape[i] += low[i] + high[i];
+		}
+		out = as_type(L, o, x.type);
+	} else {
+		Val acc = f;
+		for (size_t i = 0; i < r; ++i) {
+			std::vector<Val> parts;
+			std::vector<int64_t> shape = acc.shape;
+			if (low[i] > 0) {
+				shape[i] = low[i];
+				parts.push_back(filled(L, shape, value));
+			}
+			parts.push_back(acc);
+			if (high[i] > 0) {
+				shape[i] = high[i];
+				parts.push_back(filled(L, shape, value));
+			}
+			Val next;
+			if (!concat_dim(L, parts, i, next)) {
+				return false;
+			}
+			acc = next;
+		}
+		out = as_type(L, acc, x.type);
+	}
+	out.known = false;
+	out.hv.clear();
+	out.neg_inf = false;
+	out.pre = nullptr;
+	return true;
+}
+
+// stablehlo.pad with a constant padding value, non-negative edges and interior padding.
 bool op_pad(Lowering &L, const std::string &attrs, const Val &x, const Val &pad_value, Val &out) {
 	std::vector<int64_t> low, high, interior;
 	if (!int_list(attrs, "low", 0, low, nullptr) || !int_list(attrs, "high", 0, high, nullptr) || !int_list(attrs, "interior", 0, interior, nullptr)) {
@@ -853,34 +1074,34 @@ bool op_pad(Lowering &L, const std::string &attrs, const Val &x, const Val &pad_
 		return L.fail("stablehlo.pad: the padding lists do not match the rank");
 	}
 	if (x.t == nullptr || r > GGML_MAX_DIMS) {
-		return L.unsupported("stablehlo.pad of i32 or i1 values, or above rank 4");
+		return L.unsupported("stablehlo.pad of i32 or i1 values known at compile time, or above rank 4");
 	}
 	for (size_t i = 0; i < r; ++i) {
-		if (interior[i] != 0) {
-			return L.unsupported("stablehlo.pad with interior padding");
+		if (interior[i] < 0) {
+			return L.fail("stablehlo.pad: negative interior padding");
 		}
 		if (low[i] < 0 || high[i] < 0) {
 			return L.unsupported("stablehlo.pad with negative edge padding");
 		}
 	}
-	std::unordered_map<const ggml_tensor *, std::vector<uint8_t> >::const_iterator ci = L.consts.find(pad_value.t);
-	if (ci == L.consts.end() || !pad_value.shape.empty() || element_f32(pad_value, ci->second) != 0.0f) {
-		return L.unsupported("stablehlo.pad with a padding value other than a constant zero");
+	if (!pad_value.known || !pad_value.shape.empty() || pad_value.hv.size() != 1) {
+		return L.unsupported("stablehlo.pad with a padding value that is not a scalar constant");
 	}
-	int lp[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
-	int rp[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
+	const float value = float(pad_value.hv[0]);
+	Val acc = x;
 	for (size_t i = 0; i < r; ++i) {
-		lp[r - 1 - i] = int(low[i]);
-		rp[r - 1 - i] = int(high[i]);
+		if (interior[i] != 0) {
+			if (value != 0.0f || std::signbit(value)) {
+				return L.unsupported("stablehlo.pad with interior padding of a value other than zero");
+			}
+			Val next;
+			if (!dilate_dim(L, acc, i, interior[i], next)) {
+				return false;
+			}
+			acc = next;
+		}
 	}
-	Val f = as_type(L, x, GGML_TYPE_F32);
-	Val o = f;
-	o.t = ggml_pad_ext(L.ctx, contiguous(L, f.t), lp[0], rp[0], lp[1], rp[1], lp[2], rp[2], lp[3], rp[3]);
-	for (size_t i = 0; i < r; ++i) {
-		o.shape[i] += low[i] + high[i];
-	}
-	out = as_type(L, o, x.type);
-	return true;
+	return pad_edges(L, acc, low, high, value, out);
 }
 
 bool op_broadcast(Lowering &L, const Val &x, const std::vector<int64_t> &dims, const Ty &to, Val &out) {
@@ -1086,18 +1307,15 @@ bool op_constant(Lowering &L, const std::string &line, const Ty &ty, Val &out) {
 			}
 		}
 	} else if (body.compare(0, 2, "0x") == 0) {
-		// StableHLO writes an infinity as its hex bit pattern; any other hex literal is refused.
+		// StableHLO writes an infinity or a NaN as its hex bit pattern: one value, for every element.
 		const size_t digits = ty.type == GGML_TYPE_F32 ? 8 : 4;
-		if (!is_float(ty.type) || body.size() != 2 + digits || !ty.shape.empty()) {
-			return L.unsupported("stablehlo.constant with a hex literal other than a scalar infinity");
+		if (!is_float(ty.type) || body.size() != 2 + digits) {
+			return L.unsupported("stablehlo.constant with a hex literal that is not one float");
 		}
 		const uint32_t bits = uint32_t(std::strtoul(body.c_str() + 2, nullptr, 16));
 		const uint32_t f32_bits = ty.type == GGML_TYPE_F32 ? bits : bits << 16;
 		float f = 0.0f;
 		std::memcpy(&f, &f32_bits, 4);
-		if (!std::isinf(f)) {
-			return L.unsupported("stablehlo.constant with a hex literal other than an infinity");
-		}
 		values.push_back(double(f));
 	} else {
 		if (body.find('"') != std::string::npos || body.find("0x") != std::string::npos || body.find("inf") != std::string::npos || body.find("nan") != std::string::npos) {
@@ -1162,14 +1380,16 @@ std::vector<std::string> operands(const std::string &s, size_t &end) {
 
 // A value the device can hold: a float, or an i1 as an f32 tensor of 0 and 1. A known i1 gets its tensor here.
 bool on_device(const Val &v) {
-	return is_float(v.type) || v.type == kPred;
+	return is_float(v.type) || v.type == kPred || v.type == GGML_TYPE_I32;
 }
 
 Val device_f32(Lowering &L, const Val &v) {
-	if (v.type == kPred && v.t == nullptr) {
+	if ((v.type == kPred || v.type == GGML_TYPE_I32) && v.t == nullptr) {
+		// A whole number known at compile time, wanted on the device: its f32 constant.
 		Val o = known_val(L, GGML_TYPE_F32, v.shape, v.hv);
-		o.type = kPred;
-		return as_type(L, o, GGML_TYPE_F32);
+		o.known = false;
+		o.hv.clear();
+		return o;
 	}
 	return as_type(L, v, GGML_TYPE_F32);
 }
@@ -1292,8 +1512,8 @@ bool host_compare(Lowering &L, const std::string &dir, const std::string &kind, 
 		return L.fail("stablehlo.compare: operands differ in type or shape");
 	}
 	if (!a.known || !b.known) {
-		if (!on_device(a) || kind == "TOTALORDER") {
-			return L.unsupported("stablehlo.compare of i32 values computed at run time, or with TOTALORDER");
+		if (kind == "TOTALORDER" || kind == "UNSIGNED") {
+			return L.unsupported("stablehlo.compare of values computed at run time with TOTALORDER or UNSIGNED");
 		}
 		static const char *const kDirs[] = { "GT", "GE", "LT", "LE", "EQ", "NE" };
 		static const ggml_rd_xla_binary_kind kKinds[] = { GGML_RD_XLA_GT, GGML_RD_XLA_GE, GGML_RD_XLA_LT, GGML_RD_XLA_LE, GGML_RD_XLA_EQ, GGML_RD_XLA_NE };
@@ -1339,18 +1559,35 @@ bool host_compare(Lowering &L, const std::string &dir, const std::string &kind, 
 	return true;
 }
 
+// A float truncated toward zero, as whole numbers in f32: floor(|x|) with x's sign.
+ggml_tensor *truncated(Lowering &L, ggml_tensor *t) {
+	ggml_tensor *below = ggml_rd_xla_binary_op(L.ctx, contiguous(L, t), filled(L, {}, 0.0f).t, GGML_RD_XLA_LT);
+	return ggml_mul(L.ctx, ggml_floor(L.ctx, ggml_abs(L.ctx, t)), ggml_scale_bias(L.ctx, below, -2.0f, 1.0f));
+}
+
 bool op_convert(Lowering &L, const Val &x, const Ty &to, Val &out) {
 	if (is_float(x.type) && is_float(to.type)) {
 		out = as_type(L, x, to.type);
 		return true;
 	}
-	if (!x.known && x.type == kPred && is_float(to.type)) {
-		// A run-time i1 is already an f32 tensor of 0 and 1.
-		out = as_type(L, as_type(L, x, GGML_TYPE_F32), to.type);
+	if (x.t != nullptr && !x.known) {
+		// A value computed at run time. Whole numbers are f32 tensors, so most conversions only change the label.
+		Val f = as_type(L, x, GGML_TYPE_F32);
+		if (to.type == kPred) {
+			out = xla_binary(L, GGML_RD_XLA_NE, f, filled(L, x.shape, 0.0f), kPred);
+		} else if (to.type == GGML_TYPE_I32 && is_float(x.type)) {
+			// Exact for |x| below 2^24; a NaN or a larger value is not what XLA's cvttss2si gives.
+			f.t = truncated(L, f.t);
+			out = as_type(L, f, GGML_TYPE_I32);
+		} else {
+			out = as_type(L, f, to.type);
+		}
+		out.known = false;
+		out.hv.clear();
 		return true;
 	}
 	if (!x.known) {
-		return L.unsupported("stablehlo.convert to i32 or i1, or from i32, of a value computed at run time");
+		return L.unsupported("stablehlo.convert of this value");
 	}
 	std::vector<double> hv(x.hv.size());
 	for (size_t i = 0; i < hv.size(); ++i) {
@@ -1439,6 +1676,759 @@ bool op_select(Lowering &L, const Val &p, const Val &a, const Val &b, Val &out) 
 	return true;
 }
 
+// --- gather, slices by run-time starts, updates ---------------------------------------------------------
+
+// "key = [a, b]" or "key = array<i64: a, b>"; absent gives an empty list.
+std::vector<int64_t> int_array(const std::string &s, const std::string &key) {
+	std::vector<int64_t> out;
+	size_t k = 0;
+	while ((k = s.find(key, k)) != std::string::npos) {
+		// The key as a whole word: "pad" must not match "padding".
+		const bool starts = k == 0 || !(std::isalnum(static_cast<unsigned char>(s[k - 1])) || s[k - 1] == '_');
+		const size_t e = k + key.size();
+		if (starts && s.compare(e, 3, " = ") == 0) {
+			break;
+		}
+		k = e;
+	}
+	if (k == std::string::npos) {
+		return out;
+	}
+	size_t p = k + key.size() + 3;
+	char close = ']';
+	if (s.compare(p, 6, "array<") == 0) {
+		close = '>';
+		p = s.find(':', p);
+	} else if (s[p] != '[') {
+		char *e = nullptr;
+		out.push_back(std::strtoll(s.c_str() + p, &e, 10));
+		return out;
+	}
+	// A nested list ([[1, 1], [2, 2]]) is read flat, up to the bracket that closes the outer one.
+	int depth = 0;
+	for (++p; p < s.size(); ++p) {
+		const char c = s[p];
+		if (c == '[') {
+			++depth;
+		} else if (c == close && depth == 0) {
+			break;
+		} else if (c == ']') {
+			--depth;
+		} else if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
+			char *e = nullptr;
+			out.push_back(std::strtoll(s.c_str() + p, &e, 10));
+			p = size_t(e - s.c_str()) - 1;
+		}
+	}
+	return out;
+}
+
+// Indices for ggml_get_rows from whole numbers: clamped to [0, n - 1], as XLA's gather clamps a start index.
+ggml_tensor *row_index(Lowering &L, const Val &idx, int64_t n) {
+	const int64_t m = count_of(idx.shape);
+	if (idx.t == nullptr) {
+		ggml_tensor *t = ggml_new_tensor_1d(L.ctx, GGML_TYPE_I32, m);
+		std::vector<uint8_t> bytes(size_t(m) * 4);
+		for (int64_t i = 0; i < m; ++i) {
+			const int32_t at = int32_t(std::min<double>(std::max<double>(idx.hv[size_t(i)], 0.0), double(n - 1)));
+			std::memcpy(bytes.data() + size_t(i) * 4, &at, 4);
+		}
+		L.consts[t] = std::move(bytes);
+		return t;
+	}
+	Val f = reshaped(L, as_type(L, idx, GGML_TYPE_F32), { m });
+	ggml_tensor *c = xla_against(L, GGML_RD_XLA_MIN, xla_against(L, GGML_RD_XLA_MAX, f.t, 0.0f), float(n - 1));
+	return ggml_cast(L.ctx, c, GGML_TYPE_I32);
+}
+
+// x with dimension `axis` replaced by the elements idx names (m of them): rows of ggml_get_rows, a 32-bit copy.
+bool gather_axis(Lowering &L, const Val &x, size_t axis, ggml_tensor *idx, int64_t m, Val &out) {
+	const size_t r = x.shape.size();
+	std::vector<int64_t> perm, rest, back(r);
+	perm.push_back(int64_t(axis));
+	for (size_t i = 0; i < r; ++i) {
+		if (i != axis) {
+			perm.push_back(int64_t(i));
+			rest.push_back(x.shape[i]);
+		}
+	}
+	for (size_t i = 0; i < r; ++i) {
+		back[i] = i == axis ? 0 : int64_t(i < axis ? i + 1 : i);
+	}
+	Val rows = reshaped(L, transposed(L, as_type(L, x, GGML_TYPE_F32), perm), { x.shape[axis], count_of(rest) });
+	Val g;
+	g.t = ggml_get_rows(L.ctx, contiguous(L, rows.t), idx);
+	g.type = GGML_TYPE_F32;
+	g.shape = { m, count_of(rest) };
+	std::vector<int64_t> shape;
+	shape.push_back(m);
+	shape.insert(shape.end(), rest.begin(), rest.end());
+	size_t wide = 0;
+	for (int64_t d : shape) {
+		wide += d > 1 ? 1 : 0;
+	}
+	if (wide > GGML_MAX_DIMS) {
+		return L.unsupported("a gather whose result has more than 4 dimensions of size above one");
+	}
+	out = as_type(L, transposed(L, reshaped(L, g, shape), back), x.type);
+	out.known = false;
+	out.hv.clear();
+	return true;
+}
+
+// stablehlo.gather in the forms JAX writes for x[i], take and x[i, j]: every indexed dimension is collapsed
+// (slice size 1), the others are taken whole, and the index vector is the last dimension of the indices.
+bool op_gather(Lowering &L, const std::string &attrs, const Val &x, const Val &indices, const Ty &to, Val &out) {
+	const std::vector<int64_t> offset = int_array(attrs, "offset_dims");
+	const std::vector<int64_t> collapsed = int_array(attrs, "collapsed_slice_dims");
+	const std::vector<int64_t> map = int_array(attrs, "start_index_map");
+	const std::vector<int64_t> ivd = int_array(attrs, "index_vector_dim");
+	const std::vector<int64_t> sizes = int_array(attrs, "slice_sizes");
+	const size_t r = x.shape.size();
+	if (sizes.size() != r || ivd.size() != 1 || map.empty() || indices.shape.empty()) {
+		return L.fail("stablehlo.gather: slice_sizes, index_vector_dim or start_index_map do not fit the operand");
+	}
+	if (!int_array(attrs, "operand_batching_dims").empty() || !int_array(attrs, "start_indices_batching_dims").empty()) {
+		return L.unsupported("stablehlo.gather with batching dimensions");
+	}
+	if (indices.type != GGML_TYPE_I32 || x.t == nullptr) {
+		return L.unsupported("stablehlo.gather with indices that are not i32, or of i32 or i1 values known at compile time");
+	}
+	if (ivd[0] != int64_t(indices.shape.size()) - 1 || indices.shape.back() != int64_t(map.size())) {
+		return L.unsupported("stablehlo.gather whose index vector is not the last dimension of the indices");
+	}
+	std::vector<bool> indexed(r, false);
+	for (int64_t d : map) {
+		if (d < 0 || d >= int64_t(r) || indexed[size_t(d)]) {
+			return L.fail("stablehlo.gather: start_index_map is out of range or repeats a dimension");
+		}
+		indexed[size_t(d)] = true;
+	}
+	std::vector<int64_t> sorted_map = map, sorted_collapsed = collapsed;
+	std::sort(sorted_map.begin(), sorted_map.end());
+	std::sort(sorted_collapsed.begin(), sorted_collapsed.end());
+	if (sorted_map != sorted_collapsed) {
+		return L.unsupported("stablehlo.gather with an indexed dimension that is not collapsed, or a collapsed one that is not indexed");
+	}
+	for (size_t d = 0; d < r; ++d) {
+		if (sizes[d] != (indexed[d] ? 1 : x.shape[d])) {
+			return L.unsupported("stablehlo.gather with a slice that is a window (not one element of an indexed dimension and all of the others)");
+		}
+	}
+	std::vector<int64_t> batch(indices.shape.begin(), indices.shape.end() - 1);
+	const int64_t m = count_of(batch);
+	// The indexed dimensions first, in the order of the index vector, flattened to one: its row is the linear index.
+	std::vector<int64_t> perm = map, rest;
+	int64_t rows = 1;
+	for (int64_t d : map) {
+		rows *= x.shape[size_t(d)];
+	}
+	for (size_t d = 0; d < r; ++d) {
+		if (!indexed[d]) {
+			perm.push_back(int64_t(d));
+			rest.push_back(x.shape[d]);
+		}
+	}
+	if (rows > (int64_t(1) << 24)) {
+		return L.unsupported("stablehlo.gather over more than 2^24 rows");
+	}
+	Val linear;
+	linear.type = GGML_TYPE_I32;
+	linear.shape = { m };
+	if (indices.t == nullptr) {
+		linear.known = true;
+		linear.hv.assign(size_t(m), 0.0);
+		for (int64_t i = 0; i < m; ++i) {
+			double at = 0.0;
+			for (size_t j = 0; j < map.size(); ++j) {
+				const double n = double(x.shape[size_t(map[j])]);
+				at = at * n + std::min(std::max(indices.hv[size_t(i) * map.size() + j], 0.0), n - 1.0);
+			}
+			linear.hv[size_t(i)] = at;
+		}
+	} else if (map.size() == 1) {
+		linear = reshaped(L, indices, { m });
+	} else {
+		const Val table = reshaped(L, as_type(L, indices, GGML_TYPE_F32), { m, int64_t(map.size()) });
+		ggml_tensor *acc = nullptr;
+		for (size_t j = 0; j < map.size(); ++j) {
+			Val col;
+			if (!slice_dim(L, table, 1, int64_t(j), 1, col)) {
+				return false;
+			}
+			const float n = float(x.shape[size_t(map[j])]);
+			ggml_tensor *c = xla_against(L, GGML_RD_XLA_MIN, xla_against(L, GGML_RD_XLA_MAX, ggml_reshape_1d(L.ctx, contiguous(L, col.t), m), 0.0f), n - 1.0f);
+			acc = acc == nullptr ? c : ggml_add(L.ctx, ggml_scale(L.ctx, acc, n), c);
+		}
+		linear.t = acc;
+	}
+	std::vector<int64_t> flat;
+	flat.push_back(rows);
+	flat.insert(flat.end(), rest.begin(), rest.end());
+	const Val table = reshaped(L, transposed(L, x, perm), flat);
+	Val g;
+	if (!gather_axis(L, table, 0, row_index(L, linear, rows), m, g)) {
+		return false;
+	}
+	// g is [m, rest...]; the result has the rest at offset_dims and the batch dimensions of the indices elsewhere.
+	if (offset.size() != rest.size()) {
+		return L.fail("stablehlo.gather: offset_dims does not name every dimension that is kept");
+	}
+	std::vector<int64_t> now = batch;
+	now.insert(now.end(), rest.begin(), rest.end());
+	const size_t rr = now.size();
+	std::vector<int64_t> out_perm(rr, -1);
+	for (size_t j = 0; j < offset.size(); ++j) {
+		if (offset[j] < 0 || offset[j] >= int64_t(rr) || out_perm[size_t(offset[j])] != -1) {
+			return L.fail("stablehlo.gather: offset_dims is out of range or repeats a dimension");
+		}
+		out_perm[size_t(offset[j])] = int64_t(batch.size() + j);
+	}
+	int64_t next_batch = 0;
+	for (size_t i = 0; i < rr; ++i) {
+		if (out_perm[i] == -1) {
+			out_perm[i] = next_batch++;
+		}
+	}
+	size_t wide = 0;
+	for (int64_t d : now) {
+		wide += d > 1 ? 1 : 0;
+	}
+	if (wide > GGML_MAX_DIMS) {
+		return L.unsupported("stablehlo.gather whose result has more than 4 dimensions of size above one");
+	}
+	out = transposed(L, reshaped(L, g, now), out_perm);
+	(void)to;
+	return true;
+}
+
+// stablehlo.clamp: min(max(x, lo), hi) with XLA's maximum and minimum.
+bool op_clamp(Lowering &L, const Val &lo, const Val &x, const Val &hi, Val &out) {
+	if (lo.type != x.type || hi.type != x.type || (!lo.shape.empty() && lo.shape != x.shape) || (!hi.shape.empty() && hi.shape != x.shape)) {
+		return L.fail("stablehlo.clamp: the bounds do not match the operand");
+	}
+	if (lo.known && x.known && hi.known && x.t == nullptr) {
+		std::vector<double> hv(x.hv.size());
+		for (size_t i = 0; i < hv.size(); ++i) {
+			hv[i] = std::min(std::max(x.hv[i], lo.hv[lo.shape.empty() ? 0 : i]), hi.hv[hi.shape.empty() ? 0 : i]);
+		}
+		out = known_val(L, x.type, x.shape, std::move(hv));
+		return true;
+	}
+	if (!on_device(x) || x.type == kPred) {
+		return L.unsupported("stablehlo.clamp of this element type");
+	}
+	const Val fx = device_f32(L, x);
+	const Val fl = device_f32(L, lo);
+	const Val fh = device_f32(L, hi);
+	Val o;
+	o.t = ggml_rd_xla_binary_op(L.ctx, contiguous(L, fx.t), contiguous(L, fl.t), GGML_RD_XLA_MAX);
+	o.t = ggml_rd_xla_binary_op(L.ctx, o.t, contiguous(L, fh.t), GGML_RD_XLA_MIN);
+	o.shape = x.shape;
+	o.type = GGML_TYPE_F32;
+	out = as_type(L, o, x.type);
+	return true;
+}
+
+// The start of a dynamic slice or update: one i32 vector, or one i32 scalar for each dimension. False when a
+// start is computed at run time; then `runtime` holds the operands for the caller to refuse or gather by.
+bool known_starts(const std::vector<Val> &in, size_t first, size_t rank, std::vector<int64_t> &start) {
+	start.clear();
+	if (in.size() == first + 1 && in[first].shape.size() == 1 && in[first].shape[0] == int64_t(rank)) {
+		if (!in[first].known || in[first].t != nullptr) {
+			return false;
+		}
+		for (double v : in[first].hv) {
+			start.push_back(int64_t(v));
+		}
+		return true;
+	}
+	for (size_t k = first; k < in.size(); ++k) {
+		if (!in[k].known || in[k].t != nullptr || !in[k].shape.empty()) {
+			return false;
+		}
+		start.push_back(int64_t(in[k].hv[0]));
+	}
+	return start.size() == rank;
+}
+
+// stablehlo.dynamic_slice. A start known at compile time is a slice; one computed at run time gathers the
+// elements start .. start + size - 1 of each dimension that is not taken whole. XLA clamps the start so the
+// slice fits, and so does this.
+bool op_dynamic_slice(Lowering &L, const std::string &attrs, const std::vector<Val> &in, Val &out) {
+	const Val &x = in[0];
+	const size_t r = x.shape.size();
+	const std::vector<int64_t> sizes = int_array(attrs, "sizes");
+	if (sizes.size() != r || x.t == nullptr) {
+		return sizes.size() != r ? L.fail("stablehlo.dynamic_slice: sizes do not match the rank") : L.unsupported("stablehlo.dynamic_slice of i32 or i1 values known at compile time");
+	}
+	for (size_t d = 0; d < r; ++d) {
+		if (sizes[d] < 1 || sizes[d] > x.shape[d]) {
+			return L.fail("stablehlo.dynamic_slice: a size is outside its dimension");
+		}
+	}
+	std::vector<int64_t> start;
+	Val acc = x;
+	if (known_starts(in, 1, r, start)) {
+		for (size_t d = 0; d < r; ++d) {
+			const int64_t at = std::min(std::max<int64_t>(start[d], 0), x.shape[d] - sizes[d]);
+			if (sizes[d] != x.shape[d]) {
+				Val next;
+				if (!slice_dim(L, acc, d, at, sizes[d], next)) {
+					return false;
+				}
+				acc = next;
+			}
+		}
+		out = acc;
+		return true;
+	}
+	const bool vector = in.size() == 2 && in[1].shape.size() == 1 && in[1].shape[0] == int64_t(r);
+	if (!vector && in.size() != 1 + r) {
+		return L.fail("stablehlo.dynamic_slice: the start indices do not match the rank");
+	}
+	for (size_t d = 0; d < r; ++d) {
+		if (sizes[d] == x.shape[d]) {
+			continue;
+		}
+		Val st;
+		if (vector) {
+			if (in[1].t == nullptr) {
+				st = known_val(L, GGML_TYPE_I32, {}, { in[1].hv[d] });
+			} else if (!slice_dim(L, in[1], 0, int64_t(d), 1, st)) {
+				return false;
+			}
+		} else {
+			st = in[1 + d];
+		}
+		if (st.type != GGML_TYPE_I32) {
+			return L.fail("stablehlo.dynamic_slice: a start index is not i32");
+		}
+		ggml_tensor *s1 = ggml_reshape_1d(L.ctx, contiguous(L, device_f32(L, st).t), 1);
+		s1 = xla_against(L, GGML_RD_XLA_MIN, xla_against(L, GGML_RD_XLA_MAX, s1, 0.0f), float(x.shape[d] - sizes[d]));
+		std::vector<double> ramp(static_cast<size_t>(sizes[d]));
+		for (size_t i = 0; i < ramp.size(); ++i) {
+			ramp[i] = double(i);
+		}
+		Val base = known_val(L, GGML_TYPE_F32, { sizes[d] }, ramp);
+		ggml_tensor *idx = ggml_cast(L.ctx, ggml_add(L.ctx, base.t, s1), GGML_TYPE_I32);
+		Val next;
+		if (!gather_axis(L, acc, d, idx, sizes[d], next)) {
+			return false;
+		}
+		acc = next;
+	}
+	out = acc;
+	out.known = false;
+	out.hv.clear();
+	return true;
+}
+
+// x with the block `update` written at `start`: a concatenation of slices of x around the update, one dimension
+// at a time, so every element keeps its bits.
+bool paste(Lowering &L, const Val &x, const Val &update, const std::vector<int64_t> &start, size_t dim, Val &out) {
+	if (dim == x.shape.size()) {
+		out = update;
+		return true;
+	}
+	const int64_t n = x.shape[dim], h = update.shape[dim], s0 = start[dim];
+	if (s0 == 0 && h == n) {
+		return paste(L, x, update, start, dim + 1, out);
+	}
+	Val mid_x, mid;
+	if (!slice_dim(L, x, dim, s0, h, mid_x) || !paste(L, mid_x, update, start, dim + 1, mid)) {
+		return false;
+	}
+	std::vector<Val> parts;
+	Val before, after;
+	if (s0 > 0) {
+		if (!slice_dim(L, x, dim, 0, s0, before)) {
+			return false;
+		}
+		parts.push_back(before);
+	}
+	parts.push_back(mid);
+	if (s0 + h < n) {
+		if (!slice_dim(L, x, dim, s0 + h, n - s0 - h, after)) {
+			return false;
+		}
+		parts.push_back(after);
+	}
+	return concat_dim(L, parts, dim, out);
+}
+
+bool op_update_slice(Lowering &L, const char *what, const Val &x, const Val &update, const std::vector<int64_t> &start, Val &out) {
+	const size_t r = x.shape.size();
+	if (update.shape.size() != r || update.type != x.type || start.size() != r) {
+		return L.fail(std::string(what) + ": the update does not match the operand");
+	}
+	if (x.t == nullptr || update.t == nullptr) {
+		return L.unsupported(std::string(what) + " of i32 or i1 values known at compile time");
+	}
+	std::vector<int64_t> at = start;
+	for (size_t d = 0; d < r; ++d) {
+		if (update.shape[d] > x.shape[d]) {
+			return L.fail(std::string(what) + ": the update is larger than the operand");
+		}
+		at[d] = std::min(std::max<int64_t>(start[d], 0), x.shape[d] - update.shape[d]);
+	}
+	if (!paste(L, x, update, at, 0, out)) {
+		return false;
+	}
+	out.known = false;
+	out.hv.clear();
+	out.neg_inf = false;
+	out.pre = nullptr;
+	return true;
+}
+
+// stablehlo.scatter in the form JAX writes for x.at[a:b, c:d].set(y): one index vector known at compile time,
+// every dimension of the update a window dimension, and a body that returns the update.
+bool op_scatter(Lowering &L, const std::string &attrs, const Val &x, const Val &indices, const Val &update, Val &out) {
+	const size_t r = x.shape.size();
+	const std::vector<int64_t> window = int_array(attrs, "update_window_dims");
+	const std::vector<int64_t> to_operand = int_array(attrs, "scatter_dims_to_operand_dims");
+	const std::vector<int64_t> ivd = int_array(attrs, "index_vector_dim");
+	const size_t ret = attrs.find("stablehlo.return ");
+	const size_t bb = attrs.find("^bb0(");
+	if (ret == std::string::npos || bb == std::string::npos) {
+		return L.fail("stablehlo.scatter: no body");
+	}
+	// The body's second block argument is the update; returning it is a plain write.
+	const size_t comma = attrs.find(", %", bb);
+	const size_t colon = comma == std::string::npos ? std::string::npos : attrs.find(':', comma);
+	const std::string second = colon == std::string::npos ? std::string() : attrs.substr(comma + 2, colon - comma - 2);
+	size_t e = ret + 17;
+	while (e < attrs.size() && attrs[e] != ' ' && attrs[e] != ':') {
+		++e;
+	}
+	if (second.empty() || attrs.substr(ret + 17, e - ret - 17) != second) {
+		return L.unsupported("stablehlo.scatter with a body other than a write of the update (an add or another combine)");
+	}
+	if (!int_array(attrs, "inserted_window_dims").empty() || !int_array(attrs, "input_batching_dims").empty() || window.size() != r || update.shape.size() != r) {
+		return L.unsupported("stablehlo.scatter whose update is not one window of the operand's rank");
+	}
+	if (!indices.known || indices.t != nullptr || indices.shape.size() != 1 || (!ivd.empty() && ivd[0] != 0) || indices.shape[0] != int64_t(to_operand.size())) {
+		return L.unsupported("stablehlo.scatter with indices computed at run time, or more than one index vector");
+	}
+	std::vector<int64_t> start(r, 0);
+	for (size_t k = 0; k < to_operand.size(); ++k) {
+		if (to_operand[k] < 0 || to_operand[k] >= int64_t(r)) {
+			return L.fail("stablehlo.scatter: scatter_dims_to_operand_dims is out of range");
+		}
+		start[size_t(to_operand[k])] = int64_t(indices.hv[k]);
+	}
+	for (size_t d = 0; d < r; ++d) {
+		if (start[d] < 0 || start[d] + update.shape[d] > x.shape[d]) {
+			// StableHLO drops a window that does not fit; XLA's result for it is not measured here.
+			return L.unsupported("stablehlo.scatter with a window outside the operand");
+		}
+	}
+	return op_update_slice(L, "stablehlo.scatter", x, update, start, out);
+}
+
+// --- windows ------------------------------------------------------------------------------------------
+
+// stablehlo.reduce_window applying maximum, minimum or add, with strides and padding and no dilation. Each
+// element of the window is a strided slice, and the slices are combined one after another in the window's
+// row-major order, so no element is rounded more often than XLA's loop over the window rounds it.
+bool op_reduce_window(Lowering &L, const std::string &attrs, const Val &x, const Val &init, const Ty &to, Val &out) {
+	const size_t r = x.shape.size();
+	const std::vector<int64_t> win = int_array(attrs, "window_dimensions");
+	std::vector<int64_t> strides = int_array(attrs, "window_strides");
+	const std::vector<int64_t> base_d = int_array(attrs, "base_dilations");
+	const std::vector<int64_t> win_d = int_array(attrs, "window_dilations");
+	std::vector<int64_t> padding;
+	const size_t pk = attrs.find("padding = dense<");
+	if (pk != std::string::npos) {
+		const size_t pe = attrs.find('>', pk);
+		const std::string body = attrs.substr(pk + 16, pe - pk - 16);
+		if (body.find('[') == std::string::npos) {
+			padding.assign(r * 2, std::strtoll(body.c_str(), nullptr, 10));
+		} else {
+			padding = int_array("p = " + body, "p");
+		}
+	}
+	if (padding.empty()) {
+		padding.assign(r * 2, 0);
+	}
+	if (strides.empty()) {
+		strides.assign(r, 1);
+	}
+	if (win.size() != r || strides.size() != r || padding.size() != r * 2) {
+		return L.fail("stablehlo.reduce_window: the window, strides or padding do not match the rank");
+	}
+	for (int64_t d : base_d) {
+		if (d != 1) {
+			return L.unsupported("stablehlo.reduce_window with base dilation");
+		}
+	}
+	for (int64_t d : win_d) {
+		if (d != 1) {
+			return L.unsupported("stablehlo.reduce_window with window dilation");
+		}
+	}
+	const size_t body = attrs.find("^bb0(");
+	const bool is_max = body != std::string::npos && attrs.find("stablehlo.maximum", body) != std::string::npos;
+	const bool is_min = body != std::string::npos && attrs.find("stablehlo.minimum", body) != std::string::npos;
+	const bool is_add = body != std::string::npos && attrs.find("stablehlo.add", body) != std::string::npos;
+	if (int(is_max) + int(is_min) + int(is_add) != 1) {
+		return L.unsupported("stablehlo.reduce_window with a body other than one maximum, minimum or add");
+	}
+	if (!is_float(x.type) || x.t == nullptr || r > GGML_MAX_DIMS) {
+		return L.unsupported("stablehlo.reduce_window of values that are not floats, or above rank 4");
+	}
+	if (!init.known || count_of(init.shape) != 1) {
+		return L.unsupported("stablehlo.reduce_window with an init that is not a scalar constant");
+	}
+	const double iv = init.hv[0];
+	if (!(is_add ? (iv == 0.0 && !std::signbit(iv)) : (std::isinf(iv) && (is_max ? iv < 0.0 : iv > 0.0)))) {
+		return L.unsupported("stablehlo.reduce_window whose init is not the identity of its body");
+	}
+	std::vector<int64_t> low(r), high(r), count(r);
+	int64_t elements = 1;
+	for (size_t d = 0; d < r; ++d) {
+		low[d] = padding[d * 2];
+		high[d] = padding[d * 2 + 1];
+		if (low[d] < 0 || high[d] < 0 || win[d] < 1 || strides[d] < 1) {
+			return L.unsupported("stablehlo.reduce_window with negative padding");
+		}
+		const int64_t n = x.shape[d] + low[d] + high[d];
+		if (n < win[d]) {
+			return L.fail("stablehlo.reduce_window: the window is larger than the padded operand");
+		}
+		count[d] = (n - win[d]) / strides[d] + 1;
+		elements *= win[d];
+	}
+	if (count != to.shape) {
+		return L.fail("stablehlo.reduce_window: the result shape does not match the window");
+	}
+	if (elements > 256) {
+		return L.unsupported("stablehlo.reduce_window with a window of more than 256 elements");
+	}
+	Val padded;
+	if (!pad_edges(L, as_type(L, x, GGML_TYPE_F32), low, high, float(iv), padded)) {
+		return false;
+	}
+	padded.t = contiguous(L, padded.t);
+	Val acc;
+	bool first = true;
+	bool ok = true;
+	each_index(win, [&](const std::vector<int64_t> &off, size_t) {
+		if (!ok) {
+			return;
+		}
+		std::vector<int64_t> span(r);
+		for (size_t d = 0; d < r; ++d) {
+			span[d] = (count[d] - 1) * strides[d] + 1;
+		}
+		Val piece;
+		ok = slice_core(L, padded, off, strides, span, count, piece);
+		if (!ok) {
+			return;
+		}
+		if (first) {
+			acc = piece;
+			first = false;
+		} else if (is_add) {
+			acc.t = ggml_add(L.ctx, acc.t, piece.t);
+		} else {
+			acc.t = ggml_rd_xla_binary_op(L.ctx, acc.t, piece.t, is_max ? GGML_RD_XLA_MAX : GGML_RD_XLA_MIN);
+		}
+	});
+	if (!ok) {
+		return false;
+	}
+	acc.shape = count;
+	acc.type = GGML_TYPE_F32;
+	out = as_type(L, acc, x.type);
+	return true;
+}
+
+// stablehlo.convolution with one or two spatial dimensions: strides, padding, kernel (rhs) dilation, input (lhs)
+// dilation as JAX writes a transposed convolution, and feature groups. The operands are transposed to ggml's
+// layout ([N, C, H, W] and [O, I, KH, KW] row-major), the input is zero-stuffed for an lhs dilation and padded
+// explicitly, and the product is ggml's CONV_2D (CONV_2D_DW for a depthwise kernel).
+bool op_convolution(Lowering &L, const std::string &attrs, const Val &lhs, const Val &rhs, const Ty &to, Val &out) {
+	const size_t dn = attrs.find("dim_numbers = ");
+	const size_t wn = attrs.find("window = {");
+	if (dn == std::string::npos) {
+		return L.fail("stablehlo.convolution: no dim_numbers");
+	}
+	// "[b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]": three lists of tokens.
+	std::vector<std::vector<std::string>> lists;
+	size_t p = dn + 14;
+	while (lists.size() < 3) {
+		const size_t lb = attrs.find('[', p);
+		const size_t rb = lb == std::string::npos ? std::string::npos : attrs.find(']', lb);
+		if (rb == std::string::npos) {
+			return L.fail("stablehlo.convolution: cannot read dim_numbers");
+		}
+		std::vector<std::string> toks;
+		std::string cur;
+		for (size_t i = lb + 1; i <= rb; ++i) {
+			if (attrs[i] == ',' || attrs[i] == ']') {
+				toks.push_back(trim(cur));
+				cur.clear();
+			} else {
+				cur += attrs[i];
+			}
+		}
+		lists.push_back(toks);
+		p = rb + 1;
+	}
+	const size_t rank = lhs.shape.size();
+	const size_t ns = rank < 2 ? 0 : rank - 2;
+	if (lists[0].size() != rank || lists[1].size() != rank || lists[2].size() != rank || rhs.shape.size() != rank) {
+		return L.fail("stablehlo.convolution: dim_numbers do not match the operands");
+	}
+	if (ns < 1 || ns > 2) {
+		return L.unsupported("stablehlo.convolution with " + std::to_string(ns) + " spatial dimensions (one or two)");
+	}
+	if (!is_float(lhs.type) || !is_float(rhs.type) || lhs.t == nullptr || rhs.t == nullptr) {
+		return L.unsupported("stablehlo.convolution of values that are not floats");
+	}
+	// The position of each token in a list: the first, the second, then the spatial ones in order.
+	std::function<bool(const std::vector<std::string> &, const char *, const char *, std::vector<int64_t> &)> order =
+			[&](const std::vector<std::string> &toks, const char *first, const char *second, std::vector<int64_t> &perm) {
+				perm.assign(2 + ns, -1);
+				for (size_t i = 0; i < toks.size(); ++i) {
+					if (toks[i] == first) {
+						perm[0] = int64_t(i);
+					} else if (toks[i] == second) {
+						perm[1] = int64_t(i);
+					} else {
+						char *e = nullptr;
+						const long k = std::strtol(toks[i].c_str(), &e, 10);
+						if (toks[i].empty() || *e != '\0' || k < 0 || k >= long(ns)) {
+							return false;
+						}
+						perm[2 + size_t(k)] = int64_t(i);
+					}
+				}
+				for (int64_t v : perm) {
+					if (v < 0) {
+						return false;
+					}
+				}
+				return true;
+			};
+	std::vector<int64_t> in_perm, k_perm, out_at;
+	if (!order(lists[0], "b", "f", in_perm) || !order(lists[1], "o", "i", k_perm) || !order(lists[2], "b", "f", out_at)) {
+		return L.fail("stablehlo.convolution: cannot read dim_numbers");
+	}
+	const std::string window = wn == std::string::npos ? std::string() : attrs.substr(wn, attrs.find('}', wn) - wn);
+	std::vector<int64_t> stride = int_array(window, "stride"), pad = int_array(window, "pad"), ld = int_array(window, "lhs_dilate"), rd = int_array(window, "rhs_dilate");
+	if (window.find("true") != std::string::npos) {
+		return L.unsupported("stablehlo.convolution with a reversed window");
+	}
+	if (stride.empty()) {
+		stride.assign(ns, 1);
+	}
+	if (pad.empty()) {
+		pad.assign(ns * 2, 0);
+	}
+	if (ld.empty()) {
+		ld.assign(ns, 1);
+	}
+	if (rd.empty()) {
+		rd.assign(ns, 1);
+	}
+	if (stride.size() != ns || pad.size() != ns * 2 || ld.size() != ns || rd.size() != ns) {
+		return L.fail("stablehlo.convolution: the window does not match the spatial dimensions");
+	}
+	const std::vector<int64_t> fg = int_array(attrs, "feature_group_count"), bg = int_array(attrs, "batch_group_count");
+	const int64_t groups = fg.empty() ? 1 : fg[0];
+	if (!bg.empty() && bg[0] != 1) {
+		return L.unsupported("stablehlo.convolution with a batch group count above one");
+	}
+	Val x = transposed(L, as_type(L, lhs, GGML_TYPE_F32), in_perm); // [N, C, (H,) W]
+	Val k = transposed(L, as_type(L, rhs, GGML_TYPE_F32), k_perm); // [O, I, (KH,) KW]
+	if (ns == 1) {
+		x = reshaped(L, x, { x.shape[0], x.shape[1], 1, x.shape[2] });
+		k = reshaped(L, k, { k.shape[0], k.shape[1], 1, k.shape[2] });
+		stride.insert(stride.begin(), 1);
+		ld.insert(ld.begin(), 1);
+		rd.insert(rd.begin(), 1);
+		pad.insert(pad.begin(), 2, 0);
+	}
+	const int64_t C = x.shape[1], O = k.shape[0], I = k.shape[1];
+	if (groups < 1 || C % groups != 0 || O % groups != 0 || I * groups != C) {
+		return L.fail("stablehlo.convolution: the feature group count does not divide the channels");
+	}
+	std::vector<int64_t> low(4, 0), high(4, 0);
+	for (size_t d = 0; d < 2; ++d) {
+		if (stride[d] < 1 || ld[d] < 1 || rd[d] < 1) {
+			return L.fail("stablehlo.convolution: a stride or dilation below one");
+		}
+		if (pad[d * 2] < 0 || pad[d * 2 + 1] < 0) {
+			return L.unsupported("stablehlo.convolution with negative padding");
+		}
+		if (ld[d] > 1) {
+			Val next;
+			if (!dilate_dim(L, x, 2 + d, ld[d] - 1, next)) {
+				return false;
+			}
+			x = next;
+		}
+		low[2 + d] = pad[d * 2];
+		high[2 + d] = pad[d * 2 + 1];
+	}
+	Val padded;
+	if (!pad_edges(L, x, low, high, 0.0f, padded)) {
+		return false;
+	}
+	x = padded;
+	std::vector<int64_t> oshape = { x.shape[0], O, 0, 0 };
+	for (size_t d = 0; d < 2; ++d) {
+		const int64_t span = (k.shape[2 + d] - 1) * rd[d] + 1;
+		if (x.shape[2 + d] < span) {
+			return L.fail("stablehlo.convolution: the window is larger than the padded input");
+		}
+		oshape[2 + d] = (x.shape[2 + d] - span) / stride[d] + 1;
+	}
+	const int s0 = int(stride[1]), s1 = int(stride[0]), d0 = int(rd[1]), d1 = int(rd[0]);
+	Val y;
+	y.type = GGML_TYPE_F32;
+	y.shape = oshape;
+	if (groups == 1) {
+		y.t = ggml_conv_2d_direct(L.ctx, contiguous(L, k.t), contiguous(L, x.t), s0, s1, 0, 0, d0, d1);
+	} else if (groups == C && I == 1 && O == C) {
+		y.t = ggml_conv_2d_dw_direct(L.ctx, contiguous(L, k.t), contiguous(L, x.t), s0, s1, 0, 0, d0, d1);
+	} else {
+		if (groups > 16) {
+			return L.unsupported("stablehlo.convolution with more than 16 feature groups that is not depthwise with a multiplier of one");
+		}
+		std::vector<Val> parts;
+		for (int64_t g = 0; g < groups; ++g) {
+			Val xs, ks;
+			if (!slice_dim(L, x, 1, g * I, I, xs) || !slice_dim(L, k, 0, g * (O / groups), O / groups, ks)) {
+				return false;
+			}
+			Val part;
+			part.type = GGML_TYPE_F32;
+			part.shape = { oshape[0], O / groups, oshape[2], oshape[3] };
+			part.t = ggml_conv_2d_direct(L.ctx, contiguous(L, ks.t), contiguous(L, xs.t), s0, s1, 0, 0, d0, d1);
+			parts.push_back(part);
+		}
+		if (!concat_dim(L, parts, 1, y)) {
+			return false;
+		}
+	}
+	if (ns == 1) {
+		y = reshaped(L, y, { oshape[0], O, oshape[3] });
+	}
+	// y is [N, O, spatial...]; out_at[j] is where dimension j of that layout sits in the result.
+	std::vector<int64_t> out_perm(rank);
+	for (size_t j = 0; j < rank; ++j) {
+		out_perm[size_t(out_at[j])] = int64_t(j);
+	}
+	out = as_type(L, transposed(L, y, out_perm), to.type);
+	out.known = false;
+	out.hv.clear();
+	return true;
+}
+
 bool statement(Lowering &L, const std::string &line) {
 	const size_t eq = line.find(" = ");
 	if (line[0] != '%' || eq == std::string::npos) {
@@ -1446,6 +2436,21 @@ bool statement(Lowering &L, const std::string &line) {
 	}
 	const std::string name = line.substr(0, eq);
 	std::string rest = line.substr(eq + 3);
+	if (name.find(':') != std::string::npos) {
+		return L.unsupported("an op with more than one result (a variadic reduce, as argmax writes)");
+	}
+	if (starts_with(rest, "\"stablehlo.")) {
+		// The generic form: "stablehlo.gather"(%a, %b) <{...}> : ...
+		const size_t q = rest.find('"', 1);
+		if (q == std::string::npos) {
+			return L.fail("cannot read statement '" + line.substr(0, 60) + "'");
+		}
+		rest = rest.substr(1, q - 1) + rest.substr(q + 1);
+	}
+	if (starts_with(rest, "chlo.erf ") || starts_with(rest, "chlo.erfc ") || starts_with(rest, "chlo.square ")) {
+		// The CHLO ops JAX writes that have a lowering here; they are handled under the same names.
+		rest = "stablehlo." + rest.substr(5);
+	}
 	if (starts_with(rest, "__alias ")) {
 		// The result of an inlined call: the callee's returned value under the caller's name.
 		std::map<std::string, Val>::const_iterator it = L.vals.find(rest.substr(8));
@@ -1481,6 +2486,14 @@ bool statement(Lowering &L, const std::string &line) {
 		}
 		L.vals[name] = v;
 		return true;
+	}
+	if (op != "reduce" && tail.compare(0, 1, "(") == 0) {
+		// "convolution(%a, %b) dim_numbers = ..." and the generic form list the operands in parentheses.
+		const size_t close = tail.find(')');
+		if (close == std::string::npos) {
+			return L.fail("stablehlo." + op + ": cannot read its operands");
+		}
+		tail = tail.substr(1, close - 1) + tail.substr(close + 1);
 	}
 	if (op == "reduce" && tail.compare(0, 1, "(") == 0) {
 		// "(%x init: %i) applies ..." reads as the operands "%x, %i".
@@ -1531,7 +2544,14 @@ bool statement(Lowering &L, const std::string &line) {
 	Val out;
 	bool ok = false;
 	bool folds = true; // the op sets out.known itself
-	if (op == "add" || op == "subtract" || op == "multiply" || op == "divide" || op == "maximum" || op == "minimum" || op == "and" || op == "or" || op == "xor") {
+	if (op == "square") {
+		if (in.size() != 1) {
+			return L.fail("chlo.square takes one operand");
+		}
+		in.push_back(in[0]);
+		op = "multiply";
+	}
+	if (op == "add" || op == "subtract" || op == "multiply" || op == "divide" || op == "power" || op == "maximum" || op == "minimum" || op == "and" || op == "or" || op == "xor") {
 		if (in.size() != 2) {
 			return L.fail("stablehlo." + op + " takes two operands");
 		}
@@ -1561,10 +2581,27 @@ bool statement(Lowering &L, const std::string &line) {
 			out = xla_binary(L, k, in[0], in[1], kPred);
 			ok = true;
 			folds = false;
+		} else if (!both_known && in[0].type == GGML_TYPE_I32 && in[1].type == GGML_TYPE_I32) {
+			// i32 values computed at run time are whole numbers in f32: exact while they stay inside 2^24.
+			if (minmax) {
+				out = xla_binary(L, op == "maximum" ? GGML_RD_XLA_MAX : GGML_RD_XLA_MIN, in[0], in[1], GGML_TYPE_I32);
+			} else if (op == "add" || op == "subtract" || op == "multiply") {
+				const Val fa = device_f32(L, in[0]);
+				const Val fb = device_f32(L, in[1]);
+				Val o = fa;
+				o.t = op == "add" ? ggml_add(L.ctx, fa.t, fb.t) : op == "subtract" ? ggml_sub(L.ctx, fa.t, fb.t) : ggml_mul(L.ctx, fa.t, fb.t);
+				o.neg_inf = false;
+				o.pre = nullptr;
+				out = as_type(L, o, GGML_TYPE_I32);
+			} else {
+				return L.unsupported("stablehlo." + op + " of i32 values computed at run time (add, subtract, multiply, maximum and minimum only)");
+			}
+			ok = true;
+			folds = false;
 		} else {
 			ok = host_binary(L, op, in[0], in[1], out);
 		}
-	} else if (op == "negate" || op == "exponential" || op == "sine" || op == "cosine" || op == "log" || op == "sqrt" || op == "rsqrt" || op == "abs" || op == "floor" || op == "sign" || op == "not") {
+	} else if (op == "negate" || op == "exponential" || op == "sine" || op == "cosine" || op == "log" || op == "sqrt" || op == "rsqrt" || op == "abs" || op == "floor" || op == "sign" || op == "not" || op == "tanh" || op == "logistic" || op == "erf" || op == "erfc") {
 		if (in.size() != 1) {
 			return L.fail("stablehlo." + op + " takes one operand");
 		}
@@ -1574,6 +2611,13 @@ bool statement(Lowering &L, const std::string &line) {
 		} else if (op == "not" && in[0].type == kPred && !in[0].known) {
 			// not of a run-time i1 (0 or 1) is equal-to-zero.
 			out = xla_binary(L, GGML_RD_XLA_EQ, in[0], known_val(L, kPred, in[0].shape, std::vector<double>(size_t(count_of(in[0].shape)), 0.0)), kPred);
+			ok = true;
+			folds = false;
+		} else if (!in[0].known && in[0].type == GGML_TYPE_I32 && in[0].t != nullptr && (op == "negate" || op == "abs")) {
+			Val o = as_type(L, in[0], GGML_TYPE_F32);
+			// 0 - x and not -x: a whole number's zero stays +0.
+			o.t = op == "abs" ? ggml_abs(L.ctx, o.t) : ggml_scale_bias(L.ctx, o.t, -1.0f, 0.0f);
+			out = as_type(L, o, GGML_TYPE_I32);
 			ok = true;
 			folds = false;
 		} else {
@@ -1614,12 +2658,35 @@ bool statement(Lowering &L, const std::string &line) {
 		ok = op_concatenate(L, attrs, in, out);
 	} else if (op == "pad") {
 		ok = in.size() == 2 ? op_pad(L, attrs, in[0], in[1], out) : L.fail("stablehlo.pad takes an operand and a padding value");
-		folds = false;
 	} else if (op == "reduce") {
 		ok = in.size() == 2 ? op_reduce(L, attrs, in[0], in[1], to, out) : L.fail("stablehlo.reduce takes one operand and an init");
-		folds = false;
+		folds = ok && out.t == nullptr;
 	} else if (op == "dot_general") {
 		ok = in.size() == 2 ? op_dot(L, attrs, in[0], in[1], to, out) : L.fail("stablehlo.dot_general takes two operands");
+		folds = false;
+	} else if (op == "gather") {
+		ok = in.size() == 2 ? op_gather(L, attrs, in[0], in[1], to, out) : L.fail("stablehlo.gather takes an operand and indices");
+		folds = false;
+	} else if (op == "clamp") {
+		ok = in.size() == 3 ? op_clamp(L, in[0], in[1], in[2], out) : L.fail("stablehlo.clamp takes three operands");
+	} else if (op == "dynamic_slice") {
+		ok = in.size() >= 2 ? op_dynamic_slice(L, attrs, in, out) : L.fail("stablehlo.dynamic_slice takes an operand and start indices");
+	} else if (op == "dynamic_update_slice") {
+		std::vector<int64_t> start;
+		if (in.size() < 3) {
+			return L.fail("stablehlo.dynamic_update_slice takes an operand, an update and start indices");
+		}
+		if (!known_starts(in, 2, in[0].shape.size(), start)) {
+			return L.unsupported("stablehlo.dynamic_update_slice with start indices computed at run time");
+		}
+		ok = op_update_slice(L, "stablehlo.dynamic_update_slice", in[0], in[1], start, out);
+	} else if (op == "scatter") {
+		ok = in.size() == 3 ? op_scatter(L, attrs, in[0], in[1], in[2], out) : L.unsupported("stablehlo.scatter of more than one operand");
+	} else if (op == "reduce_window") {
+		ok = in.size() == 2 ? op_reduce_window(L, attrs, in[0], in[1], to, out) : L.unsupported("stablehlo.reduce_window of more than one operand");
+		folds = false;
+	} else if (op == "convolution") {
+		ok = in.size() == 2 ? op_convolution(L, attrs, in[0], in[1], to, out) : L.fail("stablehlo.convolution takes two operands");
 		folds = false;
 	} else {
 		return L.unsupported("stablehlo." + op);
@@ -1835,6 +2902,29 @@ bool lower_stablehlo(const std::string &text, Program &p, std::string &err) {
 		}
 		pos = nl + 1;
 	}
+	// An op with a region (reduce_window, scatter, sort, a variadic reduce) spans several lines: join them to its
+	// first, so that every statement is one line.
+	{
+		std::vector<std::string> joined;
+		for (size_t i = 0; i < lines.size(); ++i) {
+			std::string cur = lines[i];
+			if (cur[0] == '%') {
+				int depth = 0;
+				for (char c : cur) {
+					depth += c == '{' ? 1 : c == '}' ? -1 : 0;
+				}
+				while (i + 1 < lines.size() && (depth > 0 || starts_with(lines[i + 1], "reducer("))) {
+					++i;
+					for (char c : lines[i]) {
+						depth += c == '{' ? 1 : c == '}' ? -1 : 0;
+					}
+					cur += " " + lines[i];
+				}
+			}
+			joined.push_back(cur);
+		}
+		lines.swap(joined);
+	}
 	// The functions: @main and the private ones it calls, which are inlined.
 	std::map<std::string, Func> funcs;
 	std::string main_sig;
@@ -1905,7 +2995,7 @@ bool lower_stablehlo(const std::string &text, Program &p, std::string &err) {
 			flat.push_back(line);
 		}
 	}
-	ggml_init_params ip = { ggml_tensor_overhead() * (flat.size() * 48 + 64) + 4096, nullptr, true };
+	ggml_init_params ip = { ggml_tensor_overhead() * (flat.size() * 192 + 8192) + 4096, nullptr, true };
 	L.ctx = ggml_init(ip);
 	if (L.ctx == nullptr) {
 		err = "ggml_init failed";
@@ -1922,12 +3012,19 @@ bool lower_stablehlo(const std::string &text, Program &p, std::string &err) {
 			L.type_error("main parameter", perr.empty() ? std::string("no type") : perr);
 			break;
 		}
+		if (ty.type == kPred) {
+			L.unsupported("an i1 parameter of @main");
+			break;
+		}
 		Val v;
-		v.t = new_tensor(L, ty.type, ty.shape);
+		// An i32 parameter is an f32 tensor of whole numbers, like every run-time i32; Execute converts the
+		// caller's buffer (Program::arg_i32).
+		v.t = new_tensor(L, ty.type == GGML_TYPE_I32 ? GGML_TYPE_F32 : ty.type, ty.shape);
 		v.shape = ty.shape;
 		v.type = ty.type;
 		L.vals[main_sig.substr(p2, colon - p2)] = v;
 		L.params.push_back(v.t);
+		p.arg_i32.push_back(ty.type == GGML_TYPE_I32 ? 1 : 0);
 		p2 = e;
 	}
 	bool returned = false;
@@ -1954,8 +3051,8 @@ bool lower_stablehlo(const std::string &text, Program &p, std::string &err) {
 					L.fail("return: " + o + " is not defined");
 					break;
 				}
-				if (!is_float(it->second.type)) {
-					L.unsupported("returning an i32 or i1 value");
+				if (!is_float(it->second.type) && !(it->second.type == GGML_TYPE_I32 && it->second.t != nullptr)) {
+					L.unsupported("returning an i1 value, or an i32 value known at compile time");
 					break;
 				}
 				bool is_param = false;
@@ -1966,7 +3063,8 @@ bool lower_stablehlo(const std::string &text, Program &p, std::string &err) {
 					L.unsupported("returning a parameter unchanged");
 					break;
 				}
-				outs.push_back(contiguous(L, it->second.t));
+				// A run-time i32 result leaves as real i32 (the f32 to i32 copy kernel).
+				outs.push_back(it->second.type == GGML_TYPE_I32 ? ggml_cast(L.ctx, contiguous(L, it->second.t), GGML_TYPE_I32) : contiguous(L, it->second.t));
 			}
 			returned = true;
 			continue;
